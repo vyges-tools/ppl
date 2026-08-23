@@ -54,8 +54,30 @@ EXIT STATUS:
   2  error     usage error, unreadable database, or no DBU scale
 ";
 
+
+/// The pin, inherited from the crate every engine already depends on.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// The pin this binary was built against, injected into the descriptor at print time.
+///
+/// 🔑 **One definition for the whole programme, inherited rather than typed.** The SHA lives in
+/// `openroad-pin.yaml` in `vyges-opendb-lib` and reaches here through `vyges-opendb`, which this
+/// engine already depends on. Before this, every engine spelled the pin out in its own
+/// `--describe` prose, and four of them were still quoting the previous one a day after it moved.
+///
+/// ⚠️ **It reports what this BINARY was built against — not that the binary is current.** A stale
+/// build reports its stale pin quite happily. That is the point: a harness compares this against
+/// the oracle image it is about to launch and refuses on a mismatch, which is the check that was
+/// missing when two engines ran a whole gate against the previous pin's oracle.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
   "name": "ppl",
   "summary": "IO pin placement: pins on the die boundary, positioned to minimise the wire needed to reach them",
   "maturity": "partial",
@@ -84,7 +106,7 @@ const DESCRIBE: &str = r#"{
       "The default corner avoidance is resolved once from a layer's FIRST track pattern and reused for the rest, which is upstream's behavior and is observable on layers carrying mixed-pitch patterns. Reproduced deliberately.",
       "`-min_distance_in_tracks` with a distance of 0 is a division by zero upstream; here it keeps every candidate. A deliberate divergence, on an input that has no defined meaning.",
       "The simulated-annealing placement path (`place_pins -annealing`) is DEFERRED, not impossible: upstream draws from boost::random, which is specified and portable across platforms, so exact reproduction is feasible and simply not built yet. Do not read this as a principled limit.",
-      "Written against the upstream ppl sources at pin b5624809f29048e1f9ce9e83eb562620c652e084. The algorithm is reimplemented from the published behavior, not transliterated."
+      "Written against the upstream ppl sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
     "args_template": ["place-pins", "{odb}"],
@@ -1058,7 +1080,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--describe") => {
-            println!("{DESCRIBE}");
+            println!("{}", describe());
             ExitCode::SUCCESS
         }
         Some("--help") | Some("-h") | None => {
@@ -1139,5 +1161,38 @@ mod tests {
         let json = report_json(&[], Boundary { x0: 0, y0: 0, x1: 100, y1: 100 }, 1000, &[]);
         assert!(json.contains("\"status\": \"refused\""));
         assert!(json.contains("\"slots_total\": 0"));
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{describe, PIN_TOKEN};
+
+    #[test]
+    fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
+        let d = describe();
+        assert!(
+            !d.contains(PIN_TOKEN),
+            "the pin placeholder survived into the output -- the substitution did not run"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&d).expect("the descriptor is still valid JSON once filled in");
+        assert_eq!(
+            v["openroad_pin"], super::CRATE_PIN,
+            "the descriptor must report the pin this binary was actually built against"
+        );
+        assert_eq!(super::CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
+    }
+
+    /// ⛔ The whole point of inheriting the pin is that no engine carries one of its own.
+    #[test]
+    fn no_sha_is_hardcoded_anywhere_in_the_descriptor() {
+        let raw = super::DESCRIBE;
+        for tok in raw.split(|c: char| !c.is_ascii_hexdigit()) {
+            assert!(
+                tok.len() < 40,
+                "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
+            );
+        }
     }
 }
