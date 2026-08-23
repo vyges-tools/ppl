@@ -1,6 +1,6 @@
 [package]
 name = "vyges-ppl"
-version = "0.1.30"
+version = "0.1.31"
 edition = "2021"
 description = "IO pin placement over the OpenDB database: slots from routing tracks, assigned by optimal matching."
 license = "Apache-2.0"
