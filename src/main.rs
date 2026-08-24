@@ -1079,6 +1079,17 @@ fn emit_placement_events(pins: &[Pin], placed: &[Placed], unplaced: &[usize]) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // 🔑 **The commit, not just the version.** Two binaries can share a version and differ by a
+        // fix, so a bug report needs the build. build.rs prefers GITHUB_SHA on CI, which is what stops
+        // a release being stamped -dirty by the untracked files a release run leaves behind.
+        //
+        // ⚠️ Answered before --describe, --help and any argument parsing: asking a binary what it is
+        // must not depend on the rest of the command line being valid.
+        Some("--version") | Some("-V") => {
+            println!("vyges-ppl {} ({})", vyges_ppl::VERSION, env!("VYGES_GIT_SHA"));
+            println!("{}", vyges_ppl::COPYRIGHT);
+            ExitCode::SUCCESS
+        }
         Some("--describe") => {
             println!("{}", describe());
             ExitCode::SUCCESS

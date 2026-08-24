@@ -32,6 +32,12 @@
 //! | `VYGES_PPL_SECTION_TRACE` | each section's slot range and the pins routed to it |
 //! | `VYGES_PPL_GROUP_TRACE` | a pin group's candidate start positions and their costs |
 
+/// This crate's version, as Cargo knows it — the single number the whole suite is released on.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The copyright line `--version` prints.
+pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
+
 pub mod annealing;
 pub mod constraints;
 pub mod groups;
