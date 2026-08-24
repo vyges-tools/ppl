@@ -14,14 +14,21 @@ use vyges_ppl::{collect_constraints, define_slots, interval_from_rect, is_blocke
     annealing, place_with_constraints, polygon, run_round, sort_constraints, toplayer, Boundary,
     Edge, Group, LayerTracks, Params, Pin, Placement, Slot, TrackPattern, SLOTS_PER_SECTION};
 
+// ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
+// registry is what actually decides it (`group: "physical"`). It read `vyges loom ppl`
+// for a release after the construction engines were split out of the loom suite, because
+// nothing ties this string to that registry -- `vyges loom ppl` is now REFUSED by the CLI,
+// so the help was telling users a command that no longer runs. If the group ever moves,
+// this string moves with it. Running the binary directly as `vyges-ppl` always works and
+// is group-independent.
 const USAGE: &str = "\
-vyges loom ppl — IO pin placement: pins on the die boundary, where the wiring is cheapest
+vyges physical ppl — IO pin placement: pins on the die boundary, where the wiring is cheapest
 
 USAGE:
-  vyges loom ppl slots      <design.odb> --hor-layers L[,L…] --ver-layers L[,L…] [options]
-  vyges loom ppl place-pins <design.odb> --hor-layers L[,L…] --ver-layers L[,L…] [options]
-  vyges loom ppl --describe
-  vyges loom ppl --help
+  vyges physical ppl slots      <design.odb> --hor-layers L[,L…] --ver-layers L[,L…] [options]
+  vyges physical ppl place-pins <design.odb> --hor-layers L[,L…] --ver-layers L[,L…] [options]
+  vyges physical ppl --describe
+  vyges physical ppl --help
 
 OPTIONS:
   --hor-layers L,…       layers carrying pins on the LEFT and RIGHT edges (required)
@@ -75,6 +82,16 @@ fn describe() -> String {
     DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
 }
 
+// ⚠️ When a limitation below stops being true, REPLACE IT -- never append the new truth beside
+// it. Two entries here outlived their behaviour: one said polygon dies were not handled and one
+// said annealing was "DEFERRED, not built", both while the accurate entries describing the
+// shipped polygon path and the bit-exact annealing stream sat higher in the same array. A reader
+// cannot tell which of two contradicting claims is current, and this array is PUBLIC -- it is
+// what `--describe` emits and what an agent reads to decide what this engine can do. A
+// contradiction here is worse than silence: it makes the honest entries unreliable too.
+//
+// NOTE FOR EDITORS: everything between the r#" and "# is JSON, not Rust. A `//` line in there is
+// literal text and breaks the parse -- which is exactly what happened while writing this comment.
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
   "openroad_pin": "@OPENROAD_PIN@",
@@ -102,10 +119,8 @@ const DESCRIBE: &str = r#"{
       "The optimal assignment COST is unique but the optimal PAIRING is not: where two pairings cost the same, this and the reference may place two pins in swapped slots and both be correct. Compare total cost before treating a difference as a defect -- `--evaluate` scores a reference placement under the same cost model for exactly this.",
       "Slots are generated on the DIE boundary from each layer's routing track patterns, minus corner avoidance, minus half the pin width at each end, minus the requested minimum distance.",
       "PARTIAL: slot availability accounts for excluded regions and for fixed ports' metal, but NOT yet for macros or routing obstructions. Where a macro abuts the boundary, availability remains optimistic.",
-      "Polygon (non-rectangular) die areas are not handled; the four-edge rectangular path only.",
       "The default corner avoidance is resolved once from a layer's FIRST track pattern and reused for the rest, which is upstream's behavior and is observable on layers carrying mixed-pitch patterns. Reproduced deliberately.",
       "`-min_distance_in_tracks` with a distance of 0 is a division by zero upstream; here it keeps every candidate. A deliberate divergence, on an input that has no defined meaning.",
-      "The simulated-annealing placement path (`place_pins -annealing`) is DEFERRED, not impossible: upstream draws from boost::random, which is specified and portable across platforms, so exact reproduction is feasible and simply not built yet. Do not read this as a principled limit.",
       "Written against the upstream ppl sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
