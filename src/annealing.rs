@@ -26,11 +26,18 @@
 //! the extra moves: `movePinToFreeSlot` delegates to `moveGroup` — and thence to `shiftGroup`,
 //! `moveGroupToFreeSlots`, `rearrangeConstrainedGroups` — **only when `io_pin.isInGroup()`**.
 //!
-//! A constraint changes one thing: `getSlotsRange` sets `first_slot`/`last_slot` from
-//! `constraints_[idx]`, and the very same `uniform_int_distribution` is then constructed over that
-//! narrower range. Same move, same one draw per attempt, different bounds. It is a bounding rule,
-//! not a move type, and the desynchronisation argument does not apply to it — an unconstrained run
-//! already draws from `0..num_slots-1` through that same distribution.
+//! A constraint restricts the two EXISTING moves; it adds no third. In `movePinToFreeSlot`,
+//! `getSlotsRange` sets `first_slot`/`last_slot` from `constraints_[idx]` and the same
+//! `uniform_int_distribution` is built over the narrower range — same move, same one draw per
+//! attempt. In `swapPins`, a constrained `pin1` must take its partner from that constraint's own
+//! `pin_indices`: an eligibility count first, `move_fail_` if none, then a **second** distribution
+//! over `pin_indices.size()`.
+//!
+//! ⚠️ **So the old note's "their own draw patterns" was RIGHT for constraints, even though its
+//! "four more move types" was wrong** — and the first version of this correction said the
+//! desynchronisation argument did not apply, which was itself an overstatement from reading
+//! `movePinToFreeSlot` and not `swapPins`. Both callers have to be read. `swapPins` genuinely
+//! draws differently for a constrained pin.
 //!
 //! ⟹ **The refusal is therefore OVER-BROAD**, and measurably so: 6 of the 29 upstream annealing
 //! cases (`annealing_constraint1..5`, `8`) carry constraints with no groups and no mirroring, and
