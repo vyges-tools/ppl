@@ -19,9 +19,24 @@
 //!
 //! # Scope
 //!
-//! Plain pins only — no groups, no constraints, no mirrored pairs. Those add four more move types
-//! with their own draw patterns, and a partial implementation would desynchronise the stream
-//! rather than merely place them differently. [`run`] refuses instead.
+//! Plain pins only — no groups, no constraints, no mirrored pairs. [`run`] refuses instead.
+//!
+//! ⚠️ **This scope note used to say all three "add four more move types". That is FALSE for
+//! constraints, and was corrected on 2026-08-31 by reading the reference.** Only a GROUP reaches
+//! the extra moves: `movePinToFreeSlot` delegates to `moveGroup` — and thence to `shiftGroup`,
+//! `moveGroupToFreeSlots`, `rearrangeConstrainedGroups` — **only when `io_pin.isInGroup()`**.
+//!
+//! A constraint changes one thing: `getSlotsRange` sets `first_slot`/`last_slot` from
+//! `constraints_[idx]`, and the very same `uniform_int_distribution` is then constructed over that
+//! narrower range. Same move, same one draw per attempt, different bounds. It is a bounding rule,
+//! not a move type, and the desynchronisation argument does not apply to it — an unconstrained run
+//! already draws from `0..num_slots-1` through that same distribution.
+//!
+//! ⟹ **The refusal is therefore OVER-BROAD**, and measurably so: 6 of the 29 upstream annealing
+//! cases (`annealing_constraint1..5`, `8`) carry constraints with no groups and no mirroring, and
+//! we refuse all six. Kept for now because honouring a constraint means carrying a per-pin slot
+//! range through the move generators, which is real work — but kept with the true reason, not a
+//! borrowed one. See `docs/openroad/ppl/ppl-audit.md` finding 1.
 //!
 //! Nothing here touches a database.
 
@@ -70,9 +85,13 @@ pub fn perturbations_for(lone_pins: usize, groups: usize) -> i32 {
 /// Why a design cannot be annealed by this implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unsupported {
-    /// A pin group, a constraint, or a mirrored pair. Each brings its own move types, and
-    /// implementing some of them would put the random stream out of step with the reference —
-    /// which is worse than not running at all, because the result would look plausible.
+    /// A pin group or a mirrored pair — each does bring its own moves or slot-pairing, and
+    /// implementing some of them would put the random stream out of step with the reference,
+    /// which is worse than not running at all because the result would look plausible.
+    ///
+    /// ⚠️ **A constraint does NOT belong in that list** — it bounds the slot range and adds no
+    /// move. The variant is still returned for constrained designs because the range is not
+    /// carried through the move generators yet; that is a gap, not an impossibility.
     NeedsExtraMoves,
     /// Nothing to place, or nowhere to put it.
     Empty,
