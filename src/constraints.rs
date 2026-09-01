@@ -173,8 +173,18 @@ pub fn sections_for(
         if edge == interval.edge {
             // Within this layer's run, the stretch that falls inside the interval. The run may be
             // ascending or descending along the edge, so it is filtered by value, not by index.
-            let inside: Vec<usize> =
-                (i..j).filter(|&k| along(&slots[k]) >= lo && along(&slots[k]) < hi).collect();
+            // ⚠️ **The half-open end follows the edge's DIRECTION, not the coordinate axis.**
+            // Upstream scans the slot list, so its bounds are expressed against list order:
+            //   bottom/right (ascending)  begin at `xy >= interval.begin`, stop at `xy >= end`
+            //   top/left     (descending) begin at `xy <= interval.end`,   stop at `xy <= begin`
+            // which is `[begin, end)` on an ascending edge and `(begin, end]` on a descending one.
+            // Filtering `[lo, hi)` for both shifts the window one slot on top and left.
+            let inside: Vec<usize> = (i..j)
+                .filter(|&k| {
+                    let v = along(&slots[k]);
+                    if edge.is_reversed() { v > lo && v <= hi } else { v >= lo && v < hi }
+                })
+                .collect();
             if let (Some(&first), Some(&last)) = (inside.first(), inside.last()) {
                 out.extend(find_sections(slots, first, last, edge, slots_per_section));
             }
@@ -494,7 +504,16 @@ mod tests {
         for s in &sections {
             for i in s.begin_slot..=s.end_slot {
                 assert_eq!(slots[i].edge, Edge::Left, "wrong edge in a constraint section");
-                assert!((200..600).contains(&slots[i].y), "slot at y={} is outside", slots[i].y);
+                // ⚠️ **A LEFT edge is descending, so its window is `(begin, end]`** — upstream
+                // begins at `xy <= interval.end` and stops at `xy <= interval.begin`, which
+                // excludes the slot at `begin` and includes the one at `end`. An ascending edge
+                // (bottom/right) is `[begin, end)`. These assertions used to read `200..600` for
+                // both, which is the ascending rule applied to a descending edge.
+                assert!(
+                    slots[i].y > 200 && slots[i].y <= 600,
+                    "slot at y={} is outside the (200, 600] window",
+                    slots[i].y
+                );
             }
         }
     }
@@ -509,8 +528,12 @@ mod tests {
             v.iter().flat_map(|s| (s.begin_slot..=s.end_slot).map(|i| slots[i].y)).collect()
         };
         let (a, b) = (ys(&lower), ys(&upper));
-        assert!(a.contains(&400) && !a.contains(&500));
-        assert!(b.contains(&500));
+        // 🔑 **Non-overlap is the property; WHICH region takes the boundary slot follows the
+        // edge's direction.** On a LEFT edge, which is stored descending, upstream's window is
+        // `(begin, end]`, so the slot at 500 belongs to the LOWER region. The reverse holds on an
+        // ascending edge. This test used to assert the ascending answer on a descending edge.
+        assert!(a.contains(&400) && a.contains(&500), "the lower region keeps its far end");
+        assert!(!b.contains(&500), "so the upper region does not also claim it");
         assert!(a.iter().all(|y| !b.contains(y)), "the two regions overlap");
     }
 
@@ -534,7 +557,7 @@ mod tests {
         assert_eq!(placed.len(), 1);
         let s = &slots[placed[0].slot];
         assert_eq!(s.edge, Edge::Left, "the constraint won");
-        assert!((200..600).contains(&s.y));
+        assert!(s.y > 200 && s.y <= 600, "a LEFT edge's window is (begin, end]");
     }
 
     #[test]
@@ -556,11 +579,14 @@ mod tests {
         let at = |p: usize| &slots[placed.iter().find(|x| x.pin == p).unwrap().slot];
         for p in 0..4 {
             assert_eq!(at(p).edge, Edge::Left);
-            assert!((200..600).contains(&at(p).y), "constrained pin {p} left its region");
+            assert!(
+                at(p).y > 200 && at(p).y <= 600,
+                "constrained pin {p} left its (200, 600] region"
+            );
         }
         let free = at(4);
         assert!(
-            free.edge != Edge::Left || !(200..600).contains(&free.y),
+            free.edge != Edge::Left || !(free.y > 200 && free.y <= 600),
             "the free pin took a slot the constraint needed"
         );
     }
@@ -681,3 +707,4 @@ mod tests {
         assert_eq!(a, b, "no constraints must change nothing");
     }
 }
+
