@@ -97,7 +97,7 @@ const DESCRIBE: &str = r#"{
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "ppl",
   "summary": "IO pin placement: pins on the die boundary, positioned to minimise the wire needed to reach them",
-  "maturity": "partial",
+  "maturity": "structured",
   "provenance_limitations": [
       "input_hash covers the argument vector, not the content of the .odb it names.",
       "SCOPE: this build implements slot generation, EXCLUDED REGIONS (`exclude_io_pin_region`), REGION CONSTRAINTS (`set_io_pin_constraint -region edge:lo-hi`, by pin name or by direction), PIN GROUPS (`-group`/`-order`, including fallback placement for groups too large for a section), MIRRORED PIN PAIRS (`-mirrored_pins`), ports already fixed by `place_pin`, and the deterministic assignment of the remaining pins -- sections plus optimal (Hungarian) matching within each section. TOP-LAYER placement (`define_pin_shape_pattern` + `-region up:`), and the deterministic assignment of the rest. POLYGON (rectilinear) dies, SIMULATED ANNEALING for plain pins, and the deterministic assignment of the rest.",
@@ -1220,5 +1220,35 @@ mod pin_tests {
                 "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod maturity_guard {
+    //! ⛔ **`maturity` is a CLOSED ENUM of three** — `discovered`, `structured`,
+    //! `workflow-validated` — and an unrecognised word is not a modest claim, it is a DISCARDED
+    //! RESULT. `Maturity::parse` returns `None`, the consumer treats the engine as `discovered`,
+    //! `can_assert()` is false, and the verdict is suppressed to `unknown` however well-formed
+    //! the assertion is. The JSON schema's `enum` rejects it too.
+    //!
+    //! ⚠️ **Four engines shipped an invalid one at once** — `ppl`, `pad` and `dpl` said `partial`,
+    //! `pdn` said `correlated` — each chosen to sound honest about incompleteness, each silently
+    //! throwing its own verdict away. None of the four had a test on it.
+    //!
+    //! 🔑 **The rung is about the shape of the EVIDENCE, not feature completeness.** What is
+    //! unbuilt belongs in `provenance_limitations`, which is required and can carry nuance a
+    //! one-word rung cannot. `workflow-validated` additionally needs a pinned design IN THIS
+    //! REPO that the suite runs end to end and asserts against.
+    use super::DESCRIBE;
+
+    #[test]
+    fn maturity_is_one_of_the_three_legal_rungs() {
+        let v: serde_json::Value =
+            serde_json::from_str(DESCRIBE).expect("the descriptor is valid JSON");
+        let m = v["maturity"].as_str().unwrap_or_default().to_string();
+        assert!(["discovered", "structured", "workflow-validated"].contains(&m.as_str()),
+                "`{m}` is not a legal maturity; an unrecognised one suppresses the verdict");
+        assert!(!v["provenance_limitations"].as_array().expect("required").is_empty(),
+                "provenance_limitations is required and states what the hash does not cover");
     }
 }
