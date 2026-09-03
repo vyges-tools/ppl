@@ -826,6 +826,21 @@ impl Placed {
     }
 }
 
+/// A JSON string literal for `s`, escaped.
+///
+/// ⛔ **DEF escapes a bracket in a name as `\\[`, and `\\[` is not a legal JSON escape.** This
+/// report is assembled with `format!`, so a name carrying a backslash produced a file that no JSON
+/// parser would read: `ppl-place-check` died with *"Invalid \\escape"* on the whole run, not on
+/// the one case. Found 2026-09-03 when the `7d490b8` re-pin brought upstream's new
+/// `annealing_pdn_boundary` case, whose pins are `req_msg\\[0\\]`.
+///
+/// 🔑 **The escaping belongs to the SERIALIZER, not the caller.** `serde_json` is already a
+/// dependency and knows every case (backslash, quote, control characters); spelling out a
+/// `replace` chain here would be the same bug waiting for a different character.
+fn json_str(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
 fn placement_json(
     pins: &[Pin],
     groups: &[Group],
@@ -841,9 +856,9 @@ fn placement_json(
         .iter()
         .map(|p| {
             format!(
-                "    {{\"pin\": \"{}\", \"slot\": {}, \"x\": {}, \"y\": {}, \"layer\": \"{}\", \
+                "    {{\"pin\": {}, \"slot\": {}, \"x\": {}, \"y\": {}, \"layer\": \"{}\", \
                  \"edge\": \"{}\", \"hpwl\": {}}}",
-                pins[p.pin].name,
+                json_str(&pins[p.pin].name),
                 p.slot,
                 p.x,
                 p.y,
@@ -856,7 +871,7 @@ fn placement_json(
         .join(",\n");
     let missed = unplaced
         .iter()
-        .map(|&i| format!("\"{}\"", pins[i].name))
+        .map(|&i| json_str(&pins[i].name))
         .collect::<Vec<_>>()
         .join(", ");
     // The groups as READ, so a checker can verify contiguity without re-deriving them from a Tcl
@@ -866,7 +881,7 @@ fn placement_json(
         .iter()
         .map(|g| {
             let names: Vec<String> =
-                g.pins.iter().map(|&i| format!("\"{}\"", pins[i].name)).collect();
+                g.pins.iter().map(|&i| json_str(&pins[i].name)).collect();
             format!("    {{\"ordered\": {}, \"pins\": [{}]}}", g.ordered, names.join(", "))
         })
         .collect::<Vec<_>>()
@@ -1125,6 +1140,33 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⛔ **DEF escapes a bracket as `\[`, and `\[` is not a legal JSON escape.**
+    ///
+    /// The report is assembled with `format!`, so a pin named `req_msg\[0\]` produced a file no
+    /// parser would read and `ppl-place-check` died on the WHOLE run — 47 already-compared cases
+    /// lost to one unescaped character. Surfaced by upstream's new `annealing_pdn_boundary` case
+    /// at the `7d490b8` re-pin; nothing in the corpus before it had a backslash in a name.
+    #[test]
+    fn a_name_carrying_a_def_escape_still_serialises_to_readable_json() {
+        let raw = r"req_msg\[0\]";
+        let out = json_str(raw);
+        assert_eq!(out, r#""req_msg\\[0\\]""#, "the backslash must itself be escaped");
+        let back: serde_json::Value =
+            serde_json::from_str(&out).expect("a JSON parser must be able to read it back");
+        assert_eq!(back.as_str().unwrap(), raw, "and it must round-trip to the original name");
+    }
+
+    /// The other characters a hand-rolled `format!` would also have got wrong.
+    #[test]
+    fn json_str_escapes_quotes_and_control_characters_too() {
+        for raw in [r#"a"b"#, "a\tb", "a\nb", r"a\b"] {
+            let out = json_str(raw);
+            let back: serde_json::Value =
+                serde_json::from_str(&out).expect("must parse");
+            assert_eq!(back.as_str().unwrap(), raw);
+        }
+    }
 
     #[test]
     fn the_layer_lists_are_required_and_options_are_checked() {
