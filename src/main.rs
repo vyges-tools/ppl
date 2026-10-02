@@ -40,6 +40,9 @@ OPTIONS:
                          (omitted: 2 tracks, capped at 1um)
   --hor-multiplier M     widen pins on the left/right edges by this factor
   --ver-multiplier M     widen pins on the bottom/top edges by this factor
+  --hor-length L         `set_pin_length -hor_length`, microns: the depth of pins on the
+                         left/right edges, which also deepens what keeps them off nearby shapes
+  --ver-length L         the same for pins on the bottom/top edges
   --slots-per-section N  slots per matching section (default 200)
   --annealing            place by simulated annealing instead of optimal matching
   --temperature T        annealing start temperature (default 1.0)
@@ -318,11 +321,75 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
         .into_iter()
         .filter_map(|r| interval_from_rect(r, die))
         .collect();
+    // `IOPlacer::getBlockedRegions`: the placed macros (every layer), then each routing obstruction
+    // and each power-grid shape (its own layer) — see `vyges_ppl::blocked`.
+    let mut exclusions = exclusions;
+    for inst in db.block_get_insts() {
+        let master = db.inst_get_master(&inst);
+        if !(db.master_is_block(&master) && db.inst_is_placed(&inst)) {
+            continue;
+        }
+        if let Ok(b) = db.inst_bbox(&inst) {
+            if let [x0, y0, x1, y1] = b[..] {
+                let clipped = (x0.max(die.0), y0.max(die.1), x1.min(die.2), y1.min(die.3));
+                exclusions.extend(vyges_ppl::blocked::find_blocked_intervals(die, clipped));
+            }
+        }
+    }
+    let mfg = db.tech_get_manufacturing_grid();
+    // `set_pin_length -hor_length/-ver_length` (microns, to database units as `microns_to_dbu`
+    // does): it replaces the pin's depth, so it also deepens every keep-out the pin is measured
+    // against. Not stored in the database, so it arrives as a flag.
+    let user_length = |key: &str| -> Result<Option<i32>, String> { Ok(Some(microns(opts, key, dbu, -1)?).filter(|v| *v != -1)) };
+    let (hor_length, ver_length) = (user_length("hor-length")?, user_length("ver-length")?);
+    let directions: std::collections::HashMap<String, String> = db.layers_with_direction().unwrap_or_default().into_iter().collect();
+    // `IOPlacer::computePinKeepout`: a shape grown by the pin a slot on its layer would hold, plus
+    // the spacing the layer asks between the two (`computeShapeSpacing`).
+    let compute_pin_keepout = |layer: &str, b: (i32, i32, i32, i32)| {
+        let vertical = directions.get(layer).is_some_and(|d| d == "VERTICAL");
+        let multiplier = if vertical { params.thickness_multiplier_v } else { params.thickness_multiplier_h };
+        let user_length = if vertical { ver_length } else { hor_length };
+        let (half_width, height) = vyges_ppl::blocked::pin_size(db.layer_get_width(layer) as i32, db.layer_get_area(layer).unwrap_or(0), multiplier, user_length, mfg);
+        let shape_width = (b.2 - b.0).min(b.3 - b.1).max(2 * half_width);
+        let mut spacing = db.layer_get_spacing_width_length(layer, shape_width, height);
+        if spacing == 0 {
+            spacing = db.layer_get_width(layer) as i32;
+        }
+        vyges_ppl::blocked::pin_keepout(b, vertical, half_width, height, spacing)
+    };
+    let mut layered: Vec<(vyges_ppl::Interval, String)> = Vec::new();
+    // `IOPlacer::excludeBoundaryShape`.
+    let mut exclude_boundary_shape = |layer_no: i64, b: (i32, i32, i32, i32)| {
+        let layer = db.layer_name_by_number(layer_no);
+        if db.layer_get_routing_level(&layer) == 0 {
+            return;
+        }
+        let vertical = directions.get(&layer).is_some_and(|d| d == "VERTICAL");
+        if !(ver.is_empty() && hor.is_empty()) && !(if vertical { &ver } else { &hor }).contains(&layer) {
+            return;
+        }
+        let keepout = compute_pin_keepout(&layer, b);
+        for i in vyges_ppl::blocked::boundary_shape_intervals(die, keepout, vertical) {
+            layered.push((i, layer.clone()));
+        }
+    };
+    for (l, x0, y0, x1, y1) in db.pin_obstruction_boxes().unwrap_or_default() {
+        exclude_boundary_shape(l, (x0, y0, x1, y1));
+    }
+    for (l, x0, y0, x1, y1) in db.swire_boxes().unwrap_or_default() {
+        exclude_boundary_shape(l, (x0, y0, x1, y1));
+    }
+    // `initNetlist`: a fixed pin's shapes are kept PADDED by `computePinKeepout`, "so the pins
+    // created near them keep the min spacing" — every layer, no layer filter.
     let fixed_shapes: Vec<(String, i32, i32, i32, i32)> = db
         .fixed_bterm_shapes()
         .unwrap_or_default()
         .into_iter()
-        .map(|(l, x0, y0, x1, y1)| (db.layer_name_by_number(l), x0, y0, x1, y1))
+        .map(|(l, x0, y0, x1, y1)| {
+            let layer = db.layer_name_by_number(l);
+            let k = compute_pin_keepout(&layer, (x0, y0, x1, y1));
+            (layer, k.0, k.1, k.2, k.3)
+        })
         .collect();
 
     // A rectilinear die takes a different path entirely: its boundary is a list of segments, not
@@ -338,7 +405,7 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
         (define_slots(&ver_tracks, &hor_tracks, boundary, &params, dbu, &|_, _, _| false), None)
     };
     for s in slots.iter_mut() {
-        s.blocked = is_blocked(s.x, s.y, &s.layer, s.edge, &exclusions, &fixed_shapes);
+        s.blocked = is_blocked(s.x, s.y, &s.layer, s.edge, &exclusions, &fixed_shapes, &layered);
     }
     let trackless = ver_tracks
         .iter()

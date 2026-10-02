@@ -300,8 +300,13 @@ pub struct Interval {
 /// a boundary is *not* excluded. That is upstream's shape, and off-by-one here silently changes
 /// how many slots a region gives up.
 ///
-/// **A fixed port's own metal** blocks whatever it covers, on its own layer. A port placed by
-/// `place_pin` is not ours to move, and a later pin dropped onto the same slot would short to it.
+/// **A fixed port's own metal** blocks whatever it covers, on its own layer — passed in already
+/// grown by the pin keep-out (half a pin plus spacing along the edge, the pin depth plus spacing
+/// across it), so a new pin keeps its distance as well as not landing on it; the test on the
+/// grown box is inclusive. A port placed by `place_pin` is not ours to move.
+///
+/// **A layer's own blockage** — an obstruction or a power-grid shape near the edge
+/// ([`crate::blocked`]) — blocks only positions on that layer, by the same strict test.
 pub fn is_blocked(
     x: i32,
     y: i32,
@@ -309,6 +314,7 @@ pub fn is_blocked(
     edge: Edge,
     exclusions: &[Interval],
     fixed_shapes: &[(String, i32, i32, i32, i32)],
+    layered: &[(Interval, String)],
 ) -> bool {
     for (l, x0, y0, x1, y1) in fixed_shapes {
         if l == layer && (*x0..=*x1).contains(&x) && (*y0..=*y1).contains(&y) {
@@ -316,9 +322,8 @@ pub fn is_blocked(
         }
     }
     let along = if edge.is_vertical_pin() { x } else { y };
-    exclusions
-        .iter()
-        .any(|e| e.edge == edge && along > e.begin.min(e.end) && along < e.begin.max(e.end))
+    let inside = |e: &Interval| e.edge == edge && along > e.begin.min(e.end) && along < e.begin.max(e.end);
+    exclusions.iter().any(inside) || layered.iter().any(|(e, l)| l == layer && inside(e))
 }
 
 /// **P7, P8** — every slot on the die boundary, in the order the engine generates them.
@@ -661,7 +666,7 @@ mod tests {
         // ⚠️ Strict at BOTH ends: a slot exactly on the boundary is still usable. Off by one here
         // and a region silently gives up two more slots than it should.
         let ex = [Interval { edge: Edge::Bottom, begin: 200, end: 500 }];
-        let b = |x| is_blocked(x, 0, "met1", Edge::Bottom, &ex, &[]);
+        let b = |x| is_blocked(x, 0, "met1", Edge::Bottom, &ex, &[], &[]);
         assert!(!b(200), "the lower boundary is not excluded");
         assert!(b(201) && b(499));
         assert!(!b(500), "nor the upper one");
@@ -671,31 +676,31 @@ mod tests {
     #[test]
     fn an_exclusion_only_applies_to_its_own_edge_and_its_own_axis() {
         let ex = [Interval { edge: Edge::Bottom, begin: 200, end: 500 }];
-        assert!(!is_blocked(300, 0, "met1", Edge::Top, &ex, &[]), "a different edge is untouched");
+        assert!(!is_blocked(300, 0, "met1", Edge::Top, &ex, &[], &[]), "a different edge is untouched");
         // On a vertical edge the coordinate compared is y, not x.
         let left = [Interval { edge: Edge::Left, begin: 200, end: 500 }];
-        assert!(is_blocked(0, 300, "met1", Edge::Left, &left, &[]));
-        assert!(!is_blocked(300, 0, "met1", Edge::Left, &left, &[]));
+        assert!(is_blocked(0, 300, "met1", Edge::Left, &left, &[], &[]));
+        assert!(!is_blocked(300, 0, "met1", Edge::Left, &left, &[], &[]));
     }
 
     #[test]
     fn a_reversed_exclusion_interval_still_blocks_the_same_stretch() {
         let ex = [Interval { edge: Edge::Bottom, begin: 500, end: 200 }];
-        assert!(is_blocked(300, 0, "met1", Edge::Bottom, &ex, &[]));
+        assert!(is_blocked(300, 0, "met1", Edge::Bottom, &ex, &[], &[]));
     }
 
     #[test]
     fn a_fixed_ports_metal_blocks_its_own_layer_only() {
         // place_pin puts a port somewhere explicit; a later pin on the same slot shorts to it.
         let fixed = [("met1".to_string(), 100, -50, 300, 50)];
-        assert!(is_blocked(200, 0, "met1", Edge::Bottom, &[], &fixed));
-        assert!(!is_blocked(200, 0, "met2", Edge::Bottom, &[], &fixed), "a different layer is free");
-        assert!(!is_blocked(400, 0, "met1", Edge::Bottom, &[], &fixed), "and so is a clear slot");
+        assert!(is_blocked(200, 0, "met1", Edge::Bottom, &[], &fixed, &[]));
+        assert!(!is_blocked(200, 0, "met2", Edge::Bottom, &[], &fixed, &[]), "a different layer is free");
+        assert!(!is_blocked(400, 0, "met1", Edge::Bottom, &[], &fixed, &[]), "and so is a clear slot");
     }
 
     #[test]
     fn nothing_declared_blocks_nothing() {
-        assert!(!is_blocked(200, 0, "met1", Edge::Bottom, &[], &[]));
+        assert!(!is_blocked(200, 0, "met1", Edge::Bottom, &[], &[], &[]));
     }
 
     #[test]
