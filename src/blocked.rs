@@ -52,6 +52,40 @@ pub fn pin_size(min_width: i32, min_area: i64, multiplier: f64, user_length: Opt
     (half_width, height)
 }
 
+/// The spacing a pin keeps from a shape.
+///
+/// Rule (`computeShapeSpacing`): a DEF `SPACING` on the shape (`min_spacing >= 0`) REPLACES the
+/// layer rules outright — smaller than the layer's or larger, it is the answer. Otherwise the layer
+/// spacing table is read at the wider of the shape and the pin, by their parallel run (the pin's
+/// length); the shape's width is its narrow side unless a DEF `DESIGNRULEWIDTH`
+/// (`effective_width >= 0`) replaces it. A table that answers 0 falls back to the layer's minimum
+/// width. `-1` is the reference's "not carried" sentinel for both rules.
+///
+/// ⚠️ The window that added these rules first wrote the DEF spacing as a FLOOR (`max` with the
+/// layer's) and the effective width as a third candidate in the `max`; the pinned source has both
+/// as overrides. The reference trace (`instruments/ppl/ppl-boundary-patch.py`) shows a 200 rule on
+/// a layer whose own is 540 giving 200.
+pub fn shape_spacing(
+    b: Rect,
+    min_spacing: i32,
+    effective_width: i32,
+    pin_width: i32,
+    pin_length: i32,
+    layer_width: i32,
+    table: impl Fn(i32, i32) -> i32,
+) -> i32 {
+    if min_spacing >= 0 {
+        return min_spacing;
+    }
+    let shape_width = if effective_width >= 0 { effective_width } else { (b.2 - b.0).min(b.3 - b.1) };
+    let spacing = table(shape_width.max(pin_width), pin_length);
+    if spacing == 0 {
+        layer_width
+    } else {
+        spacing
+    }
+}
+
 /// Rule (`computePinKeepout`): the shape grown by the pin's half width plus the spacing ALONG the
 /// edge, and by the pin's depth plus the spacing ACROSS it. A vertical layer's pins sit on the
 /// horizontal edges, so it grows x by the half width and y by the depth; a horizontal one the
@@ -82,6 +116,25 @@ mod tests {
     use super::*;
 
     const DIE: Rect = (0, 0, 1000, 1000);
+
+    // Rule (computeShapeSpacing): a DEF SPACING replaces the layer rules whether it is larger or
+    // smaller; DESIGNRULEWIDTH replaces the shape's narrow side in the table lookup; with neither,
+    // the wider of shape and pin; a table answering 0 falls back to the layer width. The values are
+    // the reference trace's (obstruction_boundary, metal2: layer 540, half width 70).
+    #[test]
+    fn a_def_spacing_rule_overrides_the_layer_and_effective_width_replaces_the_shape_width() {
+        let table = |w: i32, l: i32| if w >= 1000 && l >= 1000 { 900 } else { 540 };
+        let wide = (150000, 292000, 154000, 296000);
+        assert_eq!(shape_spacing(wide, 5000, -1, 140, 2000, 140, table), 5000, "larger: replaces");
+        assert_eq!(shape_spacing(wide, 200, -1, 140, 2000, 140, table), 200, "smaller: still replaces");
+        assert_eq!(shape_spacing(wide, 0, -1, 140, 2000, 140, table), 0, "0 is a rule, -1 is none");
+        assert_eq!(shape_spacing(wide, -1, -1, 140, 2000, 140, table), 900, "4000 wide: the wide row");
+        let narrow = (160400, 295800, 164400, 296000);
+        assert_eq!(shape_spacing(narrow, -1, -1, 140, 2000, 140, table), 540, "200 wide: the narrow row");
+        assert_eq!(shape_spacing(narrow, -1, 2000, 140, 2000, 140, table), 900, "DESIGNRULEWIDTH 2000 picks the wide row");
+        assert_eq!(shape_spacing(wide, -1, 100, 140, 2000, 140, table), 540, "and it replaces, not floors, the shape width");
+        assert_eq!(shape_spacing(narrow, -1, -1, 140, 2000, 140, |_, _| 0), 140, "table 0 -> layer width");
+    }
 
     // Rule (findBlockedIntervals): one interval per die edge the box lies on; a corner box two.
     #[test]

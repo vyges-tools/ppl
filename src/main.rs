@@ -345,22 +345,32 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
     let directions: std::collections::HashMap<String, String> = db.layers_with_direction().unwrap_or_default().into_iter().collect();
     // `IOPlacer::computePinKeepout`: a shape grown by the pin a slot on its layer would hold, plus
     // the spacing the layer asks between the two (`computeShapeSpacing`).
-    let compute_pin_keepout = |layer: &str, b: (i32, i32, i32, i32)| {
+    // `VYGES_PPL_BOUNDARY_TRACE`: the reference's own call sequence, line for line as
+    // `instruments/ppl/ppl-boundary-patch.py` prints it, so the two diff directly.
+    let trace = std::env::var_os("VYGES_PPL_BOUNDARY_TRACE").is_some();
+    let compute_pin_keepout = |layer: &str, s: &vyges_opendb::RuledShape| {
+        let b = s.rect;
         let vertical = directions.get(layer).is_some_and(|d| d == "VERTICAL");
         let multiplier = if vertical { params.thickness_multiplier_v } else { params.thickness_multiplier_h };
         let user_length = if vertical { ver_length } else { hor_length };
-        let (half_width, height) = vyges_ppl::blocked::pin_size(db.layer_get_width(layer) as i32, db.layer_get_area(layer).unwrap_or(0), multiplier, user_length, mfg);
-        let shape_width = (b.2 - b.0).min(b.3 - b.1).max(2 * half_width);
-        let mut spacing = db.layer_get_spacing_width_length(layer, shape_width, height);
-        if spacing == 0 {
-            spacing = db.layer_get_width(layer) as i32;
+        let layer_width = db.layer_get_width(layer) as i32;
+        let (half_width, height) = vyges_ppl::blocked::pin_size(layer_width, db.layer_get_area(layer).unwrap_or(0), multiplier, user_length, mfg);
+        let spacing = vyges_ppl::blocked::shape_spacing(b, s.min_spacing, s.effective_width, 2 * half_width, height, layer_width, |w, l| {
+            db.layer_get_spacing_width_length(layer, w, l)
+        });
+        let k = vyges_ppl::blocked::pin_keepout(b, vertical, half_width, height, spacing);
+        if trace {
+            eprintln!(
+                "VYGPPL keepout|{layer}|{} {} {} {}|{}|{}|{half_width}|{height}|{spacing}|{} {} {} {}",
+                b.0, b.1, b.2, b.3, s.min_spacing, s.effective_width, k.0, k.1, k.2, k.3
+            );
         }
-        vyges_ppl::blocked::pin_keepout(b, vertical, half_width, height, spacing)
+        k
     };
     let mut layered: Vec<(vyges_ppl::Interval, String)> = Vec::new();
     // `IOPlacer::excludeBoundaryShape`.
-    let mut exclude_boundary_shape = |layer_no: i64, b: (i32, i32, i32, i32)| {
-        let layer = db.layer_name_by_number(layer_no);
+    let mut exclude_boundary_shape = |s: &vyges_opendb::RuledShape| {
+        let layer = db.layer_name_by_number(s.layer);
         if db.layer_get_routing_level(&layer) == 0 {
             return;
         }
@@ -368,27 +378,56 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
         if !(ver.is_empty() && hor.is_empty()) && !(if vertical { &ver } else { &hor }).contains(&layer) {
             return;
         }
-        let keepout = compute_pin_keepout(&layer, b);
+        let keepout = compute_pin_keepout(&layer, s);
         for i in vyges_ppl::blocked::boundary_shape_intervals(die, keepout, vertical) {
+            if trace {
+                // The reference's `Edge` numbering: top, bottom, left, right.
+                let e = match i.edge {
+                    vyges_ppl::Edge::Top => 0,
+                    vyges_ppl::Edge::Bottom => 1,
+                    vyges_ppl::Edge::Left => 2,
+                    vyges_ppl::Edge::Right => 3,
+                    vyges_ppl::Edge::Invalid => 4,
+                };
+                eprintln!("VYGPPL interval|{layer}|{e}|{}|{}", i.begin, i.end);
+            }
             layered.push((i, layer.clone()));
         }
     };
-    for (l, x0, y0, x1, y1) in db.pin_obstruction_boxes().unwrap_or_default() {
-        exclude_boundary_shape(l, (x0, y0, x1, y1));
+    // `getBlockedRegionsFromDbObstructions`: every obstruction but the system-reserved ones (the
+    // outside of a polygon die) and the fill / slot ones (routing metal may run over those), each
+    // with the DEF spacing rules it carries.
+    for o in db.obstruction_shapes_with_rules().unwrap_or_default() {
+        if o.system_reserved || o.fill || o.slot {
+            continue;
+        }
+        if trace {
+            let (s, b) = (&o.shape, o.shape.rect);
+            eprintln!("VYGPPL shape|obs|{}|{} {} {} {}|{}|{}", db.layer_name_by_number(s.layer), b.0, b.1, b.2, b.3, s.min_spacing, s.effective_width);
+        }
+        exclude_boundary_shape(&o.shape);
     }
+    // `getBlockedRegionsFromPDN`: a power-grid shape carries no DEF rule (`{rect}`, both -1).
     for (l, x0, y0, x1, y1) in db.swire_boxes().unwrap_or_default() {
-        exclude_boundary_shape(l, (x0, y0, x1, y1));
+        let s = vyges_opendb::RuledShape { layer: l, rect: (x0, y0, x1, y1), min_spacing: -1, effective_width: -1 };
+        exclude_boundary_shape(&s);
     }
-    // `initNetlist`: a fixed pin's shapes are kept PADDED by `computePinKeepout`, "so the pins
-    // created near them keep the min spacing" — every layer, no layer filter.
+    // `initNetlist` → `addFixedPinKeepouts`: for a term whose FIRST pin is fixed, each bpin that is
+    // itself fixed (a multi-bpin term can mix statuses), each box on a routing layer, kept PADDED
+    // by `computePinKeepout` with the bpin's own DEF rules, "so the pins created near them keep
+    // the min spacing". No direction-layer filter here.
     let fixed_shapes: Vec<(String, i32, i32, i32, i32)> = db
-        .fixed_bterm_shapes()
+        .bpin_shapes_with_rules()
         .unwrap_or_default()
         .into_iter()
-        .map(|(l, x0, y0, x1, y1)| {
-            let layer = db.layer_name_by_number(l);
-            let k = compute_pin_keepout(&layer, (x0, y0, x1, y1));
-            (layer, k.0, k.1, k.2, k.3)
+        .filter(|p| p.term_fixed)
+        .filter_map(|p| {
+            let layer = db.layer_name_by_number(p.shape.layer);
+            if db.layer_get_routing_level(&layer) == 0 {
+                return None;
+            }
+            let k = compute_pin_keepout(&layer, &p.shape);
+            Some((layer, k.0, k.1, k.2, k.3))
         })
         .collect();
 
