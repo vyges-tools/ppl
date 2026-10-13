@@ -201,9 +201,10 @@ pub fn sections_for(
 ///
 /// Both phases of [`place_with_constraints`] are the same round with a different set of sections —
 /// a constraint's own region, or the whole boundary — so the sequencing lives in one place.
+#[allow(clippy::too_many_arguments)]
 pub fn run_round(
-    slots: &mut Vec<Slot>,
-    sections: &mut Vec<Section>,
+    slots: &mut [Slot],
+    sections: &mut [Section],
     pins: &[Pin],
     groups: &[Group],
     which_groups: &[usize],
@@ -496,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn a_constraints_sections_cover_only_its_own_region() {
         let slots = ring();
         let interval = Interval { edge: Edge::Left, begin: 200, end: 600 };
@@ -595,7 +597,7 @@ mod tests {
     fn no_two_pins_share_a_slot_across_the_two_phases() {
         // The consumed-slot bookkeeping is what prevents this, and it is invisible until it fails.
         let slots = ring();
-        let pins: Vec<Pin> = (0..12).map(|i| pin(&format!("p{i}"), &[(i as i32 * 80, 500)])).collect();
+        let pins: Vec<Pin> = (0..12).map(|i| pin(&format!("p{i}"), &[(i * 80, 500)])).collect();
         let c = vec![
             Constraint { interval: Interval { edge: Edge::Left, begin: 0, end: 400 }, pins: vec![0, 1] },
             Constraint { interval: Interval { edge: Edge::Bottom, begin: 0, end: 400 }, pins: vec![2, 3] },
@@ -701,7 +703,7 @@ mod tests {
     #[test]
     fn with_no_constraints_it_is_the_plain_placement() {
         let slots = ring();
-        let pins: Vec<Pin> = (0..6).map(|i| pin(&format!("p{i}"), &[(i as i32 * 150, 500)])).collect();
+        let pins: Vec<Pin> = (0..6).map(|i| pin(&format!("p{i}"), &[(i * 150, 500)])).collect();
         let a = place_with_constraints(&slots, &pins, &[], &[], &all(&pins), 200, DIE);
         let b = crate::sections::place(&slots, &pins, &[], 200, DIE);
         assert_eq!(a, b, "no constraints must change nothing");

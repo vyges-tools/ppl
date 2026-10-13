@@ -821,6 +821,7 @@ fn anneal_config(opts: &Opts) -> Result<annealing::Anneal, String> {
 /// Obstructions are gathered from the three sources that matter on that layer and no others:
 /// routing blockages, the power grid, and ports already fixed. All are filtered to the grid's own
 /// layer — metal on a different layer is not in the way.
+#[allow(clippy::type_complexity)]
 fn read_top_layer(
     db: &Db,
     die: (i32, i32, i32, i32),
@@ -859,6 +860,7 @@ fn read_top_layer(
 }
 
 /// Place the top-layer pins on their lattice: sections per region, then optimal matching.
+#[allow(clippy::type_complexity)]
 fn place_top_layer(
     slots: &[Slot],
     pins: &[Pin],
@@ -947,6 +949,7 @@ fn json_str(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn placement_json(
     pins: &[Pin],
     groups: &[Group],

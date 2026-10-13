@@ -170,6 +170,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)]
     fn a_uniform_real_matches_the_reference_stream() {
         let mut g = Mt19937::new(42);
         let got: Vec<f32> = (0..8).map(|_| g.uniform_real()).collect();

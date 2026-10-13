@@ -203,6 +203,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn a_position_is_blocked_when_the_PIN_leaves_the_die_not_the_point() {
         // The point is inside; the 40-wide pin centred on it is not.
         let g = grid();
@@ -259,6 +260,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn a_constraint_region_narrows_which_positions_are_offered() {
         let s = slots(&grid(), DIE, &[]);
         let secs = sections_for(&s, (0, 0, 150, 150), 200);

@@ -504,6 +504,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn a_fallback_run_is_the_first_one_long_enough() {
         let mut slots = row(20, Edge::Bottom);
         for k in 3..6 {

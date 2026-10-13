@@ -386,7 +386,7 @@ mod tests {
     fn a_run_places_every_pin_in_a_distinct_slot() {
         let s = slots(40);
         let pins: Vec<Pin> =
-            (0..12).map(|i| pin(&format!("p{i}"), &[(i as i32 * 300, 900)])).collect();
+            (0..12).map(|i| pin(&format!("p{i}"), &[(i * 300, 900)])).collect();
         let cfg = Anneal { max_iterations: 50, ..Default::default() };
         let placed = run(&s, &pins, DIE, &cfg).unwrap();
 
@@ -404,7 +404,7 @@ mod tests {
         // the same starting assignment the run itself begins from.
         let s = slots(60);
         let pins: Vec<Pin> =
-            (0..20).map(|i| pin(&format!("p{i}"), &[(i as i32 * 290, 700)])).collect();
+            (0..20).map(|i| pin(&format!("p{i}"), &[(i * 290, 700)])).collect();
         let cfg = Anneal { max_iterations: 300, ..Default::default() };
 
         let mut start = State::new(&s, &pins, &cfg);
@@ -424,7 +424,7 @@ mod tests {
         // Reproducibility is the property the whole RNG effort exists to buy.
         let s = slots(40);
         let pins: Vec<Pin> =
-            (0..15).map(|i| pin(&format!("p{i}"), &[(i as i32 * 250, 800)])).collect();
+            (0..15).map(|i| pin(&format!("p{i}"), &[(i * 250, 800)])).collect();
         let cfg = Anneal { max_iterations: 40, ..Default::default() };
 
         let a = run(&s, &pins, DIE, &cfg).unwrap();
@@ -437,6 +437,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn a_blocked_slot_is_never_used() {
         let mut s = slots(30);
         for i in 0..20 {
@@ -454,7 +455,7 @@ mod tests {
         // cold run should end up no worse than the hot one on a problem this small.
         let s = slots(50);
         let pins: Vec<Pin> =
-            (0..16).map(|i| pin(&format!("p{i}"), &[(i as i32 * 300, 600)])).collect();
+            (0..16).map(|i| pin(&format!("p{i}"), &[(i * 300, 600)])).collect();
         let cost = |cfg: &Anneal| -> i64 {
             run(&s, &pins, DIE, cfg)
                 .unwrap()

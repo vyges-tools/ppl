@@ -248,6 +248,7 @@ pub fn layer_slots(
 /// Two readings of `-min_distance`, and they are genuinely different. As a **length**, a candidate
 /// survives when it is far enough from the last one *kept*. As a **count of tracks**, every Nth
 /// candidate survives regardless of distance.
+#[allow(clippy::explicit_counter_loop)]
 pub fn enforce_spacing(slots: &[(i32, i32)], params: &Params) -> Vec<(i32, i32)> {
     if slots.is_empty() {
         return Vec::new();

@@ -667,7 +667,7 @@ mod tests {
     fn place_puts_every_pin_somewhere_distinct() {
         let slots = bottom_row(50);
         let pins: Vec<Pin> =
-            (0..20).map(|i| pin(&format!("p{i}"), &[(i as i32 * 200, 700)])).collect();
+            (0..20).map(|i| pin(&format!("p{i}"), &[(i * 200, 700)])).collect();
         let (placed, unplaced) = place(&slots, &pins, &[], 8, (0, 0, 10_000, 10_000));
 
         assert!(unplaced.is_empty(), "room for all of them");
