@@ -59,28 +59,39 @@ pub fn positions(grid: &Grid) -> Vec<(i32, i32)> {
     out
 }
 
+/// An obstruction on the grid's layer and the keepout it is padded by: `(rect, keepout)`.
+pub type Obstruction = ((i32, i32, i32, i32), i32);
+
 /// **T2** — is a position unusable?
 ///
 /// Two reasons, and both are about the **pin's rectangle**, not the point:
 ///
 /// - The pin would extend **beyond the die**. A lattice position near the region's edge is a legal
 ///   point and an illegal pin.
-/// - The pin, grown by the keepout, would **touch an obstruction** — a routing blockage, a
-///   power-grid wire, or a port already fixed, on the grid's own layer.
+/// - The position lies in an obstruction's **keepout rect** (`filterObstructedSlotsForTopLayer`):
+///   the obstruction grown by half the pin plus that obstruction's own keepout — the grid's
+///   keepout floored at the spacing the obstruction asks (`computeShapeSpacing`, computed by the
+///   caller, which reads the rules). **Touching counts** (`Rect::intersects(Point)` is inclusive).
 ///
-/// Checking the point instead of the rectangle passes positions where the pin does not fit, which
-/// is the whole failure mode this guards against.
-pub fn blocked(grid: &Grid, at: (i32, i32), die: (i32, i32, i32, i32), obstructions: &[(i32, i32, i32, i32)]) -> bool {
+/// Each obstruction is `(rect, keepout)`.
+pub fn blocked(grid: &Grid, at: (i32, i32), die: (i32, i32, i32, i32), obstructions: &[Obstruction]) -> bool {
     let (hw, hh) = (grid.pin_width / 2, grid.pin_height / 2);
     let (dx0, dy0, dx1, dy1) = die;
     if at.0 - hw < dx0 || at.1 - hh < dy0 || at.0 + hw > dx1 || at.1 + hh > dy1 {
         return true;
     }
-    let k = grid.keepout;
-    let (px0, py0, px1, py1) = (at.0 - hw - k, at.1 - hh - k, at.0 + hw + k, at.1 + hh + k);
-    obstructions
-        .iter()
-        .any(|&(ox0, oy0, ox1, oy1)| px0 < ox1 && ox0 < px1 && py0 < oy1 && oy0 < py1)
+    obstructions.iter().any(|&(o, k)| {
+        let r = keepout_rect(grid, o, k);
+        r.0 <= at.0 && at.0 <= r.2 && r.1 <= at.1 && at.1 <= r.3
+    })
+}
+
+/// Rule (`filterObstructedSlotsForTopLayer`): the obstruction padded by the pin footprint instead
+/// of one rect per slot — half the pin width plus the keepout across x, half the height plus the
+/// keepout across y.
+pub fn keepout_rect(grid: &Grid, o: (i32, i32, i32, i32), keepout: i32) -> (i32, i32, i32, i32) {
+    let (ax, ay) = (grid.pin_width / 2 + keepout, grid.pin_height / 2 + keepout);
+    (o.0 - ax, o.1 - ay, o.2 + ax, o.3 + ay)
 }
 
 /// **T1, T2** — the top-layer slot list.
@@ -90,7 +101,7 @@ pub fn blocked(grid: &Grid, at: (i32, i32), die: (i32, i32, i32, i32), obstructi
 pub fn slots(
     grid: &Grid,
     die: (i32, i32, i32, i32),
-    obstructions: &[(i32, i32, i32, i32)],
+    obstructions: &[Obstruction],
 ) -> Vec<Slot> {
     positions(grid)
         .into_iter()
@@ -217,23 +228,26 @@ mod tests {
     #[test]
     fn an_obstruction_blocks_a_position_whose_pin_would_touch_it() {
         let g = grid();
-        let obs = [(200, 200, 260, 260)];
+        let obs = [((200, 200, 260, 260), 0)];
         assert!(blocked(&g, (230, 230), DIE, &obs), "straight through it");
         assert!(!blocked(&g, (100, 100), DIE, &obs), "well clear");
         // The pin is 40 wide, so its edge reaches 180..220 — it clips the obstruction at 200.
         assert!(blocked(&g, (200, 230), DIE, &obs), "the pin RECTANGLE clips it");
+        // Rule (`keepout_rect.intersects(slot.pos)`, inclusive): a pin whose edge only TOUCHES
+        // the obstruction (160..200 against 200) is blocked.
+        assert!(blocked(&g, (180, 230), DIE, &obs), "touching counts");
+        assert!(!blocked(&g, (179, 230), DIE, &obs), "one short of touching does not");
     }
 
     #[test]
     fn the_keepout_widens_what_counts_as_touching() {
-        let obs = [(200, 200, 260, 260)];
-        let bare = grid();
+        let o = (200, 200, 260, 260);
+        let g = grid();
         // The pin is 40 wide, so at x = 100 its own edge reaches 120 — 80 short of the
-        // obstruction. A keepout of 110 closes that gap and nothing smaller does.
-        let guarded = Grid { keepout: 110, ..grid() };
-        assert!(!blocked(&bare, (100, 230), DIE, &obs), "clear without a keepout");
-        assert!(!blocked(&Grid { keepout: 60, ..grid() }, (100, 230), DIE, &obs), "60 is not enough");
-        assert!(blocked(&guarded, (100, 230), DIE, &obs), "110 reaches it");
+        // obstruction. A keepout of 80 reaches it (touching counts) and nothing smaller does.
+        assert!(!blocked(&g, (100, 230), DIE, &[(o, 0)]), "clear without a keepout");
+        assert!(!blocked(&g, (100, 230), DIE, &[(o, 79)]), "79 is not enough");
+        assert!(blocked(&g, (100, 230), DIE, &[(o, 80)]), "80 touches");
     }
 
     #[test]

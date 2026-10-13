@@ -842,17 +842,54 @@ fn read_top_layer(
         region: g.region,
     };
 
-    let on_layer = |v: Vec<(i64, i32, i32, i32, i32)>| -> Vec<(i32, i32, i32, i32)> {
-        v.into_iter()
-            .filter(|&(l, ..)| db.layer_name_by_number(l) == g.layer)
-            .map(|(_, x0, y0, x1, y1)| (x0, y0, x1, y1))
-            .collect()
-    };
-    let mut obstructions = on_layer(db.obstruction_boxes().unwrap_or_default());
-    obstructions.extend(on_layer(db.swire_boxes().unwrap_or_default()));
-    obstructions.extend(on_layer(db.fixed_bterm_shapes().unwrap_or_default()));
+    // `filterObstructedSlotsForTopLayer`, in its order: routing obstructions (system-reserved
+    // ones too — "the only filter for slots outside of polygon dies" — but NOT `+ FILLS` /
+    // `+ SLOTS`, which "still allow routing metal over them"), with their DEF rules; the power
+    // grid (`{rect}`, no rules); then every bpin whose OWN status is fixed, with its rules.
+    let mut shapes: Vec<vyges_opendb::RuledShape> = db
+        .obstruction_shapes_with_rules()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|o| !(o.fill || o.slot))
+        .map(|o| o.shape)
+        .collect();
+    shapes.extend(db.swire_boxes().unwrap_or_default().into_iter().map(|(l, x0, y0, x1, y1)| {
+        vyges_opendb::RuledShape { layer: l, rect: (x0, y0, x1, y1), min_spacing: -1, effective_width: -1 }
+    }));
+    shapes.extend(db.bpin_shapes_with_rules().unwrap_or_default().into_iter().map(|b| b.shape));
+    // Each keeps out by the grid's keepout FLOORED at the spacing it asks (`computeShapeSpacing`,
+    // the pin's smaller dimension as its width and its larger as the run length).
+    // `VYGES_PPL_TOPLAYER_TRACE`: the reference's `VYGPPL topobs` / `topslot` lines
+    // (`instruments/ppl/ppl-toplayer-patch.py`), so the two diff directly.
+    let trace = std::env::var_os("VYGES_PPL_TOPLAYER_TRACE").is_some();
+    let (pin_min, pin_max) = (g.pin_width.min(g.pin_height), g.pin_width.max(g.pin_height));
+    let layer_width = db.layer_get_width(&g.layer) as i32;
+    let obstructions: Vec<toplayer::Obstruction> = shapes
+        .iter()
+        .filter(|s| db.layer_name_by_number(s.layer) == g.layer)
+        .map(|s| {
+            let b = s.rect;
+            let spacing = vyges_ppl::blocked::shape_spacing(b, s.min_spacing, s.effective_width, pin_min, pin_max, layer_width, |w, l| {
+                db.layer_get_spacing_width_length(&g.layer, w, l)
+            });
+            let keepout = grid.keepout.max(spacing);
+            if trace {
+                let k = toplayer::keepout_rect(&grid, b, keepout);
+                eprintln!(
+                    "VYGPPL topobs|{} {} {} {}|{}|{}|{spacing}|{keepout}|{} {} {} {}",
+                    b.0, b.1, b.2, b.3, s.min_spacing, s.effective_width, k.0, k.1, k.2, k.3
+                );
+            }
+            (b, keepout)
+        })
+        .collect();
 
     let slots = toplayer::slots(&grid, die, &obstructions);
+    if trace {
+        for (i, s) in slots.iter().enumerate() {
+            eprintln!("VYGPPL topslot|{i}|{} {}|{}", s.x, s.y, u8::from(s.blocked));
+        }
+    }
     let claimed = toplayer::constrained_pins(pins, &|i| {
         db.bterm_constraint_region(&pins[i].name).ok().flatten()
     });
