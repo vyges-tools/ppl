@@ -43,6 +43,11 @@ OPTIONS:
   --hor-length L         `set_pin_length -hor_length`, microns: the depth of pins on the
                          left/right edges, which also deepens what keeps them off nearby shapes
   --ver-length L         the same for pins on the bottom/top edges
+  --hor-extension L      `set_pin_length_extension -hor_extension`, microns: how far pins on the
+                         left/right edges reach OUT past the die (written pins only)
+  --ver-extension L      the same for pins on the bottom/top edges
+  --out-odb FILE         write the placed pins into a copy of the database: each port's pin
+                         replaced by one rectangle on its layer, PLACED
   --slots-per-section N  slots per matching section (default 200)
   --annealing            place by simulated annealing instead of optimal matching
   --temperature T        annealing start temperature (default 1.0)
@@ -116,7 +121,7 @@ const DESCRIBE: &str = r#"{
       "Constraints are read back from the DATABASE, where `set_io_pin_constraint` stores them on the ports -- they are not command-line arguments here. A constrained pin is placed BEFORE any free pin, into sections cut from its own region, and the slots it takes are withdrawn; the reverse order would let a free pin occupy a region a constrained pin has no alternative to.",
       "Where two constraint regions OVERLAP, the one with more room per pin is served first, since whoever is served first takes the shared slots. Non-overlapping constraints keep the design's own order.",
       "A constrained pin that does not fit its region is reported UNPLACED, not relocated: the design asked for a region, and somewhere else is not a smaller version of that answer.",
-      "It reports the chosen pin positions; it does not yet write them to the database, because the pin RECTANGLE depends on pin length and extension handling that is not built.",
+      "It reports the chosen pin positions, and with `--out-odb` WRITES them: each placed port's pins replaced by one rectangle on its layer, PLACED -- the depth from the layer's minimum width and area (or `--hor-length`/`--ver-length`), widened by the thickness multiplier, extended out of the die by `--hor-extension`/`--ver-extension`, oriented from the position (from probes either side of the segment on a polygon die). Measured 2026-10-14: every pin both this and the reference place at the same point carries an identical DEF record, 4853 of 4853, rectangle and polygon dies alike. A placement that leaves a pin unplaced writes nothing.",
       "Assignment is optimal WITHIN a section and greedy BETWEEN sections: pins are routed to the cheapest section with room, and only then matched optimally inside it. This is the reference decomposition, not an approximation introduced here.",
       "Cost is half-perimeter wirelength over the net bounding box. A net whose driver or loads are unplaced uses the die centre for them, as the reference does.",
       "The optimal assignment COST is unique but the optimal PAIRING is not: where two pairings cost the same, this and the reference may place two pins in swapped slots and both be correct. Compare total cost before treating a difference as a defect -- `--evaluate` scores a reference placement under the same cost model for exactly this.",
@@ -128,7 +133,7 @@ const DESCRIBE: &str = r#"{
   ],
   "invocation": {
     "args_template": ["place-pins", "{odb}"],
-    "optional": [ { "arg": "out", "flag": "-o" } ],
+    "optional": [ { "arg": "out", "flag": "-o" }, { "arg": "out_odb", "flag": "--out-odb" } ],
     "emits_json": true
   },
   "inputs": {
@@ -140,11 +145,12 @@ const DESCRIBE: &str = r#"{
       "ver_layers": { "type": "string", "description": "comma-separated layers for the bottom/top edges" },
       "min_distance": { "type": "string", "description": "minimum pin spacing in microns" },
       "corner_avoidance": { "type": "string", "description": "clearance from each corner in microns" },
-      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+      "out": { "type": "string", "description": "write the report to FILE instead of stdout" },
+      "out_odb": { "type": "string", "description": "write the database with the placed pins to FILE" }
     }
   },
   "consumes": ["odb"],
-  "produces": [],
+  "produces": ["odb"],
   "artifacts": [ { "role": "slot_report", "field": "report_path" } ],
   "assertion": {
     "id": "pins-placed",
@@ -550,7 +556,7 @@ fn place_pins(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let p = match prepare(&opts) {
+    let mut p = match prepare(&opts) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vyges-ppl: {e}");
@@ -778,11 +784,81 @@ fn place_pins(args: &[String]) -> ExitCode {
         eprintln!("vyges-ppl: {e}");
         return ExitCode::from(2);
     }
+    if let Some(out) = opts.get("out-odb") {
+        if let Err((code, e)) = commit_pins(&opts, &mut p, &pins, &placed, &unplaced, out) {
+            eprintln!("vyges-ppl: {e}");
+            return ExitCode::from(code);
+        }
+    }
     if unplaced.is_empty() && !pins.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
+}
+
+/// `IOPlacer::commitIOPlacementToDB`: every placed pin's port pins replaced by one pin on its
+/// layer — the rectangle `updatePinArea` gives it — PLACED, and the database written to `out`.
+///
+/// A pin's orientation comes from its position on a rectangle (`updateOrientation`), from probes
+/// either side of its segment on a polygon (`updateOrientationPolygon`). Refused: a placement that
+/// left a pin unplaced (upstream stops with PPL-0039 before committing anything).
+/// Errors as upstream's: no manufacturing grid (PPL-0020), a pin smaller than its layer's minimum
+/// area (PPL-0079).
+fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[Placed], unplaced: &[usize], out: &str) -> Result<(), (u8, String)> {
+    use vyges_ppl::commit::{area, orientation, pin_rect, polygon_orientation, top_layer_rect, Orientation};
+    let ring = p.db.die_area_polygon().unwrap_or_default();
+    let segments = vyges_ppl::polygon::segments(&ring);
+    if !unplaced.is_empty() {
+        return Err((1, format!("PPL-0039 Assigned {} pins out of {} IO pins: nothing written.", placed.len(), placed.len() + unplaced.len())));
+    }
+    let mfg = p.db.tech_get_manufacturing_grid();
+    if mfg == 0 {
+        return Err((2, "PPL-0020 Manufacturing grid is not defined.".into()));
+    }
+    let length = |key: &str| -> Result<Option<i32>, (u8, String)> { Ok(Some(microns(opts, key, p.dbu, -1).map_err(|e| (2, e))?).filter(|v| *v != -1)) };
+    let (hor_length, ver_length) = (length("hor-length")?, length("ver-length")?);
+    let (hor_ext, ver_ext) = (length("hor-extension")?.unwrap_or(0), length("ver-extension")?.unwrap_or(0));
+    let (mul_h, mul_v) = (multiplier(opts, "hor-multiplier").map_err(|e| (2, e))?, multiplier(opts, "ver-multiplier").map_err(|e| (2, e))?);
+    let (hor, ver) = (layer_list(opts, "hor-layers"), layer_list(opts, "ver-layers"));
+    let directions: std::collections::HashMap<String, String> = p.db.layers_with_direction().unwrap_or_default().into_iter().collect();
+    let top = p.db.bterm_top_layer_grid().ok().flatten();
+    let die = (p.boundary.x0, p.boundary.y0, p.boundary.x1, p.boundary.y1);
+    let mut rects = Vec::with_capacity(placed.len());
+    for x in placed {
+        let name = &pins[x.pin].name;
+        let r = if x.slot >= p.slots.len() {
+            let g = top.as_ref().ok_or((2, format!("{name}: a top-layer pin with no top-layer grid")))?;
+            top_layer_rect((x.x, x.y), g.pin_width, g.pin_height)
+        } else {
+            if !hor.contains(&x.layer) && !ver.contains(&x.layer) {
+                return Err((2, format!("PPL-0077 Layer {} of Pin {name} not found.", x.layer)));
+            }
+            let o = match &p.on_segment {
+                // The slot's segment says whether to probe across x or across y.
+                Some(on) => polygon_orientation((x.x, x.y), segments[on[x.slot]].a.0 == segments[on[x.slot]].b.0, &ring)
+                    .ok_or((2, format!("PPL-9999 Could not determine orientation for pin {name}")))?,
+                None => orientation((x.x, x.y), die).ok_or((2, format!("{name}: placed off the die boundary")))?,
+            };
+            // `computePinSize` reads the LAYER's direction, not the edge's.
+            let vertical = directions.get(&x.layer).is_some_and(|d| d == "VERTICAL");
+            let (mul, user) = if vertical { (mul_v, ver_length) } else { (mul_h, hor_length) };
+            let min_area = p.db.layer_get_area(&x.layer).unwrap_or(0);
+            let (half_width, height) = vyges_ppl::blocked::pin_size(p.db.layer_get_width(&x.layer) as i32, min_area, mul, user, mfg);
+            let ext = if matches!(o, Orientation::North | Orientation::South) { ver_ext } else { hor_ext };
+            let r = pin_rect((x.x, x.y), o, half_width, height, ext);
+            if area(r) < min_area {
+                return Err((2, format!("PPL-0079 Pin {name} area is lesser than the minimum required area.")));
+            }
+            r
+        };
+        rects.push((name.clone(), x.layer.clone(), r));
+    }
+    for (name, layer, r) in &rects {
+        p.db.bterm_clear_unfixed_bpins(name).map_err(|e| (2, format!("{name}: {e}")))?;
+        p.db.place_bterm(name, layer, r.0, r.1, r.2, r.3).map_err(|e| (2, format!("{name}: {e}")))?;
+    }
+    p.db.write(out).map_err(|e| (2, format!("cannot write {out}: {e}")))
 }
 
 /// The placement, with the total cost alongside it.

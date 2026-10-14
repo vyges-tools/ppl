@@ -40,6 +40,7 @@ pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.
 
 pub mod annealing;
 pub mod blocked;
+pub mod commit;
 pub mod constraints;
 pub mod groups;
 pub mod hungarian;
