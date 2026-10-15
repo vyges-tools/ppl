@@ -307,8 +307,7 @@ pub fn match_section(
         return None;
     }
 
-    // Pins are rows and slots are columns: there are never fewer slots than pins in a section, and
-    // the solver needs the short side first.
+    // A row per pin here (the cost of each pin at each usable slot); the solver takes it transposed.
     //
     // ⚠️ **A mirrored pin's row is scaled by 256 with a tie-break rank in the low byte.** The rank
     // orders that pin's positions by how evenly the pair's cost splits, so among equal totals the
@@ -335,14 +334,17 @@ pub fn match_section(
         })
         .collect();
 
-    let assignment = crate::hungarian::solve(&cost)?;
-    Some(
-        assignment
-            .into_iter()
-            .enumerate()
-            .map(|(row, col)| Placement { pin: section.pins[row], slot: usable[col] })
-            .collect(),
-    )
+    // The solver sees the matrix the other way round — a row per usable slot, a column per pin, C
+    // `int` costs — because among equal totals the pairing it returns depends on that orientation.
+    let by_slot: Vec<Vec<i32>> = (0..usable.len()).map(|s| cost.iter().map(|row| row[s] as i32).collect()).collect();
+    let by_row = crate::hungarian::munkres(&by_slot);
+    // `getFinalAssignment`: pins in order, each at the first slot row assigned to its column.
+    let mut out = Vec::with_capacity(section.pins.len());
+    for (col, &pin) in section.pins.iter().enumerate() {
+        let row = by_row.iter().position(|&c| c == Some(col))?;
+        out.push(Placement { pin, slot: usable[row] });
+    }
+    Some(out)
 }
 
 /// **H6** — solve a set of sections that already have their pins and groups assigned.

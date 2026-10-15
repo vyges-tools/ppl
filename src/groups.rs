@@ -228,13 +228,20 @@ pub fn match_in_section(
             );
         }
     }
-    let assignment = crate::hungarian::solve(&cost)?;
+    // The solver sees a row per starting slot and a column per group, C `int` costs (a forbidden
+    // cell `INT_MAX`) — the orientation decides which pairing comes out among equal totals.
+    let by_start: Vec<Vec<i32>> = (0..starts.len())
+        .map(|s| cost.iter().map(|row| if row[s] >= FORBIDDEN { i32::MAX } else { row[s] as i32 }).collect())
+        .collect();
+    let by_row = crate::hungarian::munkres(&by_start);
+    // `getAssignmentForGroups`: groups in order, each at the first starting-slot row assigned to it.
     let mut out = Vec::new();
-    for (row, col) in assignment.into_iter().enumerate() {
+    for (row, &g) in members.iter().enumerate() {
+        let col = by_row.iter().position(|&c| c == Some(row))?;
         if cost[row][col] >= FORBIDDEN {
             return None;
         }
-        let group = &groups[members[row]];
+        let group = &groups[g];
         let start = starts[col];
         let reversed = group.ordered && matches!(section.edge, Edge::Top | Edge::Left);
         for (n, &p) in group.pins.iter().enumerate() {
