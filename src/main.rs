@@ -810,9 +810,11 @@ fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[Placed], u
     let ring = p.db.die_area_polygon().unwrap_or_default();
     let segments = vyges_ppl::polygon::segments(&ring);
     if !unplaced.is_empty() {
-        return Err((1, format!("PPL-0039 Assigned {} pins out of {} IO pins: nothing written.", placed.len(), placed.len() + unplaced.len())));
+        // The reference's error, word for word: it stops here too, nothing written.
+        return Err((1, format!("PPL-0039 Assigned {} pins out of {} IO pins.", placed.len(), placed.len() + unplaced.len())));
     }
     let mfg = p.db.tech_get_manufacturing_grid();
+    let dbu_um = f64::from(p.db.tech_get_db_units_per_micron());
     if mfg == 0 {
         return Err((2, "PPL-0020 Manufacturing grid is not defined.".into()));
     }
@@ -837,7 +839,7 @@ fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[Placed], u
             let o = match &p.on_segment {
                 // The slot's segment says whether to probe across x or across y.
                 Some(on) => polygon_orientation((x.x, x.y), segments[on[x.slot]].a.0 == segments[on[x.slot]].b.0, &ring)
-                    .ok_or((2, format!("PPL-9999 Could not determine orientation for pin {name}")))?,
+                    .ok_or((2, format!("PPL-9999 Could not determine orientation for pin {name} at ({:.2}um, {:.2}um)", f64::from(x.x) / dbu_um, f64::from(x.y) / dbu_um)))?,
                 None => orientation((x.x, x.y), die).ok_or((2, format!("{name}: placed off the die boundary")))?,
             };
             // `computePinSize` reads the LAYER's direction, not the edge's.
@@ -848,7 +850,8 @@ fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[Placed], u
             let ext = if matches!(o, Orientation::North | Orientation::South) { ver_ext } else { hor_ext };
             let r = pin_rect((x.x, x.y), o, half_width, height, ext);
             if area(r) < min_area {
-                return Err((2, format!("PPL-0079 Pin {name} area is lesser than the minimum required area.")));
+                let um2 = |a: i64| a as f64 / (dbu_um * dbu_um);
+                return Err((2, format!("PPL-0079 Pin {name} area {:2.4}um^2 is lesser than the minimum required area {:2.4}um^2.", um2(area(r)), um2(min_area))));
             }
             r
         };
