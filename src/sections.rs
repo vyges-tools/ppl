@@ -210,10 +210,20 @@ pub fn assign_pins_to_sections(
     };
     for idx in mirrored_first {
         let mut order: Vec<usize> = (0..sections.len()).collect();
-        let costs: Vec<i64> =
-            sections.iter().map(|s| pin_cost(pins, idx, s.pos, die)).collect();
-        // Stable, so equal-cost sections stay in boundary order rather than in an arbitrary one.
-        order.sort_by_key(|&i| costs[i]);
+        // `sortIndexes(dst, larger_cost, used_slots)`: the cost, then — for a mirrored pin only —
+        // the larger half of the pair's cost (an even split first) and the section's used slots
+        // (the emptier first); a free pin's ties stay in boundary order (the sort is stable).
+        let keys: Vec<(i64, i64, usize)> = sections
+            .iter()
+            .map(|s| {
+                let cost = pin_cost(pins, idx, s.pos, die);
+                match pins[idx].mirror {
+                    Some(_) => (cost, pin_balance(pins, idx, s.pos, die), s.used_slots),
+                    None => (cost, 0, 0),
+                }
+            })
+            .collect();
+        order.sort_by_key(|&i| keys[i]);
         match order.into_iter().find(|&i| sections[i].used_slots < sections[i].num_slots) {
             Some(i) => {
                 sections[i].pins.push(idx);
@@ -715,6 +725,28 @@ mod tests {
         assert!(apart > together);
         // The unmirrored pin costs only itself.
         assert_eq!(pin_cost(&pins, 1, (0, 500), die), net_hpwl(&pins[1].sinks, (0, 500)));
+    }
+
+    // Rule (assignPinToSection, `sortIndexes(dst, larger_cost, used_slots)`): a mirrored pin's
+    // sections tie-break on the larger half of the pair's cost — the even split first — then on the
+    // emptier section, not on boundary order (add_constraint9: resp_msg[3] went one section early).
+    #[test]
+    fn a_mirrored_pin_breaks_cost_ties_by_balance_then_by_used_slots() {
+        let die = (0, 0, 1000, 1000);
+        // On the bottom edge at x in [0, 600] the pair costs 600 in total; the halves are x and 600 - x.
+        let pins = vec![
+            Pin { name: "a".into(), sinks: vec![(0, 0)], mirror: Some(1) },
+            Pin { name: "b".into(), sinks: vec![(600, 1000)], mirror: None },
+        ];
+        let sec = |x: i32, used: usize| Section { pos: (x, 0), num_slots: 10, used_slots: used, begin_slot: 0, end_slot: 9, edge: Edge::Bottom, pins: vec![] };
+        let mut sections = vec![sec(100, 0), sec(300, 0)];
+        assert_eq!(pin_cost(&pins, 0, (100, 0), die), pin_cost(&pins, 0, (300, 0), die), "a cost tie");
+        assign_pins_to_sections(&pins, &[0], &mut sections, die);
+        assert_eq!((sections[0].pins.len(), sections[1].pins.len()), (0, 1), "the even split (x = 300)");
+        // Equal cost and equal balance (x = 200 and 400 mirror each other's halves): the emptier one.
+        let mut sections = vec![sec(200, 3), sec(400, 1)];
+        assign_pins_to_sections(&pins, &[0], &mut sections, die);
+        assert_eq!((sections[0].pins.len(), sections[1].pins.len()), (0, 1), "the emptier section");
     }
 
     #[test]
