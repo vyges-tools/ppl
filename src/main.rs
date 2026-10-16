@@ -10,6 +10,25 @@
 
 use std::process::ExitCode;
 use vyges_opendb::Db;
+
+/// A diagnostic as a structured event (`PPL-ERROR`, `vyges-events/1.0`) instead of a bare stderr line;
+/// text after a blank line (the usage) stays plain help. The `VYGPPL` probe lines stay plain.
+fn diag_line(msg: String) {
+    let (head, help) = match msg.split_once("\n\n") {
+        Some((h, rest)) => (h.to_string(), Some(rest.to_string())),
+        None => (msg, None),
+    };
+    let text = head.strip_prefix("vyges-ppl: ").unwrap_or(&head).to_string();
+    vyges_events::emit(&vyges_events::Event::new("vyges-ppl", vyges_events::Severity::Error, text).with_code("PPL-ERROR"));
+    if let Some(h) = help {
+        eprintln!("{h}");
+    }
+}
+
+macro_rules! diag {
+    ($($t:tt)*) => { diag_line(format!($($t)*)) };
+}
+
 use vyges_ppl::{collect_constraints, define_slots, interval_from_rect, is_blocked,
     annealing, place_with_constraints, polygon, run_round, sort_constraints, toplayer, Boundary,
     Edge, Group, LayerTracks, Params, Pin, Placement, Slot, TrackPattern, SLOTS_PER_SECTION};
@@ -523,14 +542,14 @@ fn slots(args: &[String]) -> ExitCode {
     let opts = match parse_opts(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("vyges-ppl: {e}\n\n{USAGE}");
+            diag!("vyges-ppl: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
     let p = match prepare(&opts) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("vyges-ppl: {e}");
+            diag!("vyges-ppl: {e}");
             return ExitCode::from(2);
         }
     };
@@ -538,7 +557,7 @@ fn slots(args: &[String]) -> ExitCode {
     emit_slot_events(&p.slots, &p.trackless);
     let report = report_json(&p.slots, p.boundary, p.dbu, &p.trackless);
     if let Err(e) = write_report(&opts, &report) {
-        eprintln!("vyges-ppl: {e}");
+        diag!("vyges-ppl: {e}");
         return ExitCode::from(2);
     }
     if p.slots.is_empty() {
@@ -552,14 +571,14 @@ fn place_pins(args: &[String]) -> ExitCode {
     let opts = match parse_opts(args) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("vyges-ppl: {e}\n\n{USAGE}");
+            diag!("vyges-ppl: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
     let mut p = match prepare(&opts) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("vyges-ppl: {e}");
+            diag!("vyges-ppl: {e}");
             return ExitCode::from(2);
         }
     };
@@ -568,7 +587,7 @@ fn place_pins(args: &[String]) -> ExitCode {
         Some(v) => match v.parse::<usize>() {
             Ok(n) if n > 0 => n,
             _ => {
-                eprintln!("vyges-ppl: --slots-per-section wants a positive whole number");
+                diag!("vyges-ppl: --slots-per-section wants a positive whole number");
                 return ExitCode::from(2);
             }
         },
@@ -658,7 +677,7 @@ fn place_pins(args: &[String]) -> ExitCode {
         let cfg = match anneal_config(&opts) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("vyges-ppl: {e}");
+                diag!("vyges-ppl: {e}");
                 return ExitCode::from(2);
             }
         };
@@ -670,7 +689,7 @@ fn place_pins(args: &[String]) -> ExitCode {
         match outcome {
             Ok(v) => Some(v),
             Err(why) => {
-                eprintln!(
+                diag!(
                     "vyges-ppl: cannot anneal this design ({why:?}); \
                      re-run without --annealing to place it by matching"
                 );
@@ -771,7 +790,7 @@ fn place_pins(args: &[String]) -> ExitCode {
         Some(path) => match score_reference(path, &pins) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("vyges-ppl: {e}");
+                diag!("vyges-ppl: {e}");
                 return ExitCode::from(2);
             }
         },
@@ -781,12 +800,12 @@ fn place_pins(args: &[String]) -> ExitCode {
     let report =
         placement_json(&pins, &groups, &placed, &unplaced, p.boundary, &outline, p.dbu, reference);
     if let Err(e) = write_report(&opts, &report) {
-        eprintln!("vyges-ppl: {e}");
+        diag!("vyges-ppl: {e}");
         return ExitCode::from(2);
     }
     if let Some(out) = opts.get("out-odb") {
         if let Err((code, e)) = commit_pins(&opts, &mut p, &pins, &placed, &unplaced, out) {
-            eprintln!("vyges-ppl: {e}");
+            diag!("vyges-ppl: {e}");
             return ExitCode::from(code);
         }
     }
@@ -1359,7 +1378,7 @@ fn main() -> ExitCode {
         Some("slots") => slots(&args[1..]),
         Some("place-pins") => place_pins(&args[1..]),
         Some(other) => {
-            eprintln!("vyges-ppl: unknown command `{other}`\n\n{USAGE}");
+            diag!("vyges-ppl: unknown command `{other}`\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
