@@ -68,7 +68,7 @@ not built yet.
 
 ## Correctness
 
-Validated against OpenROAD's IO placer at a pinned commit, on every test case that does not use a
+Validated against the reference IO placer at a pinned commit, on every test case that does not use a
 feature listed above as unimplemented: **the total wirelength of this engine's placement equals the
 reference's**, and every region constraint is independently verified to be satisfied.
 
