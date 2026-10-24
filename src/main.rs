@@ -29,6 +29,23 @@ macro_rules! diag {
     ($($t:tt)*) => { diag_line(format!($($t)*)) };
 }
 
+/// The run's message lines (`[INFO PPL-nnnn] text`), written through the suite logger: each line
+/// on stderr as it is logged, and an event under its code.
+struct RunLog(vyges_events::logger::Logger);
+
+impl RunLog {
+    fn new() -> Self {
+        RunLog(vyges_events::logger::Logger::new().events("vyges-ppl"))
+    }
+
+    fn info(&mut self, (id, text): (u16, String)) {
+        self.0.info("PPL", id, text);
+        for l in self.0.take_lines() {
+            eprintln!("{l}");
+        }
+    }
+}
+
 use vyges_ppl::{collect_constraints, define_slots, interval_from_rect, is_blocked,
     annealing, place_with_constraints, polygon, run_round, sort_constraints, toplayer, Boundary,
     Edge, Group, LayerTracks, Params, Pin, Placement, Slot, TrackPattern, SLOTS_PER_SECTION};
@@ -640,6 +657,19 @@ fn place_pins(args: &[String]) -> ExitCode {
     // Pins sent to the top layer are placed on their own lattice, not on the boundary, so they are
     // taken out of the edge problem entirely rather than competing in it.
     let (top_slots, top_pins) = read_top_layer(&p.db, die, &pins);
+    // `printConfig`: what the run was given, before any pin is assigned.
+    let mut log = RunLog::new();
+    let config = vyges_ppl::report::Config {
+        available_slots: p.slots.iter().filter(|s| !s.blocked).count(),
+        top_layer_slots: top_slots.len(),
+        ios: pins.len(),
+        ios_without_sink: pins.iter().filter(|pin| p.db.net_iterms(&p.db.bterm_net(&pin.name)).is_empty()).count(),
+        groups: groups.len(),
+        slots_per_section: (!opts.annealing).then_some(per_section),
+    };
+    for line in vyges_ppl::report::config(&config) {
+        log.info(line);
+    }
     let top_set: std::collections::BTreeSet<usize> = top_pins.iter().map(|&(i, _)| i).collect();
     let (top_placed, mut unplaced) = place_top_layer(&top_slots, &pins, &top_pins, per_section);
 
@@ -769,6 +799,12 @@ fn place_pins(args: &[String]) -> ExitCode {
     placed.sort_by_key(|x| x.pin);
     unplaced.sort_unstable();
     unplaced.dedup();
+    if annealed.is_none() {
+        log.info(vyges_ppl::report::sections_assigned(pins.len() - unplaced.len(), pins.len()));
+    }
+    if unplaced.is_empty() {
+        log.info(vyges_ppl::report::io_hpwl(&pins, placed.iter().map(|x| (x.pin, (x.x, x.y))), p.dbu));
+    }
 
     emit_slot_events(&p.slots, &p.trackless);
     if p.exclusions > 0 {

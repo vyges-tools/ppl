@@ -46,6 +46,7 @@ pub mod groups;
 pub mod hungarian;
 pub mod sections;
 pub mod polygon;
+pub mod report;
 pub mod rng;
 pub mod slots;
 pub mod toplayer;
