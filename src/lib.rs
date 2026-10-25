@@ -32,6 +32,10 @@
 //! | `VYGES_PPL_SECTION_TRACE` | each section's slot range and the pins routed to it |
 //! | `VYGES_PPL_GROUP_TRACE` | a pin group's candidate start positions and their costs |
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_ppl::…` paths resolve here.
+extern crate self as vyges_ppl;
+
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -64,3 +68,10 @@ pub use slots::{
     corner_avoidance, define_slots, enforce_spacing, is_blocked, layer_slots, slot_step, Boundary,
     Edge, Interval, LayerTracks, Params, Slot, TrackPattern, DEFAULT_MIN_DIST, NUM_TRACKS_OFFSET,
 };
+
+/// The `vyges-ppl` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
