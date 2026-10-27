@@ -163,9 +163,9 @@ const DESCRIBE: &str = r#"{
       "The optimal assignment COST is unique but the optimal PAIRING is not: where two pairings cost the same, this and the reference may place two pins in swapped slots and both be correct. Compare total cost before treating a difference as a defect -- `--evaluate` scores a reference placement under the same cost model for exactly this.",
       "Slots are generated on the DIE boundary from each layer's routing track patterns, minus corner avoidance, minus half the pin width at each end, minus the requested minimum distance.",
       "PARTIAL: slot availability accounts for excluded regions and for fixed ports' metal, but NOT yet for macros or routing obstructions. Where a macro abuts the boundary, availability remains optimistic.",
-      "The default corner avoidance is resolved once from a layer's FIRST track pattern and reused for the rest, which is upstream's behavior and is observable on layers carrying mixed-pitch patterns. Reproduced deliberately.",
-      "`-min_distance_in_tracks` with a distance of 0 is a division by zero upstream; here it keeps every candidate. A deliberate divergence, on an input that has no defined meaning.",
-      "Written against the upstream ppl sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
+      "The default corner avoidance is resolved once from a layer's FIRST track pattern and reused for the rest, which is the reference's behavior and is observable on layers carrying mixed-pitch patterns. Reproduced deliberately.",
+      "`-min_distance_in_tracks` with a distance of 0 is a division by zero in the reference; here it keeps every candidate. A deliberate divergence, on an input that has no defined meaning.",
+      "Written against the reference ppl sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
     "args_template": ["place-pins", "{odb}"],
