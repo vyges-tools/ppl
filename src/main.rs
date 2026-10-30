@@ -40,6 +40,21 @@ impl RunLog {
 
     fn info(&mut self, (id, text): (u16, String)) {
         self.0.info("PPL", id, text);
+        self.flush();
+    }
+
+    fn warn(&mut self, id: u16, text: String) {
+        self.0.warn("PPL", id, text);
+        self.flush();
+    }
+
+    /// An uncoded line the command's Tcl prints (`utl::report`).
+    fn report(&mut self, text: String) {
+        self.0.report(text);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
         for l in self.0.take_lines() {
             eprintln!("{l}");
         }
@@ -599,6 +614,23 @@ fn place_pins(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // `place_pins`' Tcl, before it hands over: every BLOCK instance is a blockage when placed
+    // (PPL-15 when not), and the count is reported; with no -min_distance, the 2-track default.
+    let mut log = RunLog::new();
+    let mut macros = 0;
+    for inst in p.db.inst_names() {
+        if p.db.master_get_type(&p.db.inst_master(&inst)).unwrap_or_default().starts_with("BLOCK") {
+            if p.db.inst_is_placed(&inst) {
+                macros += 1;
+            } else {
+                log.warn(15, format!("Macro {inst} is not placed."));
+            }
+        }
+    }
+    log.report(format!("Found {macros} macro blocks."));
+    if opts.get("min-distance").is_none() {
+        log.report("Using 2 tracks default min distance between IO pins.".into());
+    }
     let per_section = match opts.get("slots-per-section") {
         None => SLOTS_PER_SECTION,
         Some(v) => match v.parse::<usize>() {
@@ -658,7 +690,6 @@ fn place_pins(args: &[String]) -> ExitCode {
     // taken out of the edge problem entirely rather than competing in it.
     let (top_slots, top_pins) = read_top_layer(&p.db, die, &pins);
     // `printConfig`: what the run was given, before any pin is assigned.
-    let mut log = RunLog::new();
     let config = vyges_ppl::report::Config {
         available_slots: p.slots.iter().filter(|s| !s.blocked).count(),
         top_layer_slots: top_slots.len(),
