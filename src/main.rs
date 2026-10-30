@@ -1382,7 +1382,7 @@ fn emit_placement_events(pins: &[Pin], placed: &[Placed], unplaced: &[usize]) {
             if unplaced.is_empty() { Severity::Info } else { Severity::Error },
             format!("placed {} of {} pin(s)", placed.len(), pins.len()),
         )
-        .with_code("PPL-PLACED"),
+        .with_code("PPL-DONE"),
     );
 }
 
