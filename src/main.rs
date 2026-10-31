@@ -183,8 +183,20 @@ const DESCRIBE: &str = r#"{
       "Written against the reference ppl sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
-    "args_template": ["place-pins", "{odb}"],
-    "optional": [ { "arg": "out", "flag": "-o" }, { "arg": "out_odb", "flag": "--out-odb" } ],
+    "args_template": ["place-pins", "{odb}", "--hor-layers", "{hor_layers}", "--ver-layers", "{ver_layers}"],
+    "optional": [
+      { "arg": "min_distance", "flag": "--min-distance" },
+      { "arg": "min_distance_in_tracks", "flag": "--min-distance-in-tracks" },
+      { "arg": "corner_avoidance", "flag": "--corner-avoidance" },
+      { "arg": "hor_length", "flag": "--hor-length" },
+      { "arg": "ver_length", "flag": "--ver-length" },
+      { "arg": "hor_extension", "flag": "--hor-extension" },
+      { "arg": "ver_extension", "flag": "--ver-extension" },
+      { "arg": "annealing", "flag": "--annealing" },
+      { "arg": "random_seed", "flag": "--random-seed" },
+      { "arg": "out", "flag": "-o" },
+      { "arg": "out_odb", "flag": "--out-odb" }
+    ],
     "emits_json": true
   },
   "inputs": {
@@ -194,8 +206,15 @@ const DESCRIBE: &str = r#"{
       "odb": { "type": "string", "description": "path to the design database (.odb)" },
       "hor_layers": { "type": "string", "description": "comma-separated layers for the left/right edges" },
       "ver_layers": { "type": "string", "description": "comma-separated layers for the bottom/top edges" },
-      "min_distance": { "type": "string", "description": "minimum pin spacing in microns" },
-      "corner_avoidance": { "type": "string", "description": "clearance from each corner in microns" },
+      "min_distance": { "type": "number", "description": "minimum pin spacing in microns (omitted: candidates every 2 tracks)" },
+      "min_distance_in_tracks": { "type": "boolean", "description": "read min_distance as a count of candidate slots instead" },
+      "corner_avoidance": { "type": "number", "description": "clearance from each corner in microns (omitted: 2 tracks, capped at 1um)" },
+      "hor_length": { "type": "number", "description": "depth of pins on the left/right edges, in microns" },
+      "ver_length": { "type": "number", "description": "depth of pins on the bottom/top edges, in microns" },
+      "hor_extension": { "type": "number", "description": "how far pins on the left/right edges reach past the die, in microns" },
+      "ver_extension": { "type": "number", "description": "the same for pins on the bottom/top edges" },
+      "annealing": { "type": "boolean", "description": "place by simulated annealing instead of optimal matching" },
+      "random_seed": { "type": "integer", "description": "annealing seed (default 42)" },
       "out": { "type": "string", "description": "write the report to FILE instead of stdout" },
       "out_odb": { "type": "string", "description": "write the database with the placed pins to FILE" }
     }
@@ -1606,5 +1625,43 @@ mod maturity_guard {
                 "`{m}` is not a legal maturity; an unrecognised one suppresses the verdict");
         assert!(!v["provenance_limitations"].as_array().expect("required").is_empty(),
                 "provenance_limitations is required and states what the hash does not cover");
+    }
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::DESCRIBE;
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
     }
 }
