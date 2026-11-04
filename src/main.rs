@@ -61,9 +61,9 @@ impl RunLog {
     }
 }
 
-use vyges_ppl::{collect_constraints, define_slots, interval_from_rect, is_blocked,
+use vyges_ppl::{collect_constraints,
     annealing, place_with_constraints, polygon, run_round, sort_constraints, toplayer, Boundary,
-    Edge, Group, LayerTracks, Params, Pin, Placement, Slot, TrackPattern, SLOTS_PER_SECTION};
+    Edge, Group, Params, Pin, Placement, Slot, SLOTS_PER_SECTION};
 
 // ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
 // registry is what actually decides it (`group: "physical"`). It read `vyges loom ppl`
@@ -286,29 +286,6 @@ fn multiplier(opts: &Opts, key: &str) -> Result<f64, String> {
     }
 }
 
-/// Read one layer's contribution to a slot list.
-///
-/// ⚠️ Two accessors on the layer are a letter apart and both bridged: upstream takes
-/// `getWidth()`, **not** `getMinWidth()`. Picking the other one compiles and quietly misplaces the
-/// outermost slot on every edge, so it is worth naming here rather than in a commit message.
-///
-/// The axis follows the edge, not the layer's own routing direction: pins on the bottom and top
-/// run down the **x** track patterns, pins on the left and right down the **y** ones.
-fn read_layer(db: &Db, layer: &str, vertical_pins: bool) -> Result<LayerTracks, String> {
-    let (x, y) = db
-        .track_patterns(layer)
-        .map_err(|e| format!("layer `{layer}`: cannot read track patterns: {e}"))?;
-    let chosen = if vertical_pins { x } else { y };
-    Ok(LayerTracks {
-        layer: layer.to_string(),
-        patterns: chosen
-            .into_iter()
-            .map(|(origin, count, step)| TrackPattern { origin, count, step })
-            .collect(),
-        min_width: db.layer_get_width(layer) as i32,
-    })
-}
-
 fn layer_list(opts: &Opts, key: &str) -> Vec<String> {
     opts.get(key)
         .unwrap_or_default()
@@ -329,19 +306,7 @@ fn edge_name(e: Edge) -> &'static str {
     }
 }
 
-/// Everything both verbs need out of the database and the command line.
-struct Prepared {
-    db: Db,
-    boundary: Boundary,
-    dbu: i32,
-    slots: Vec<Slot>,
-    trackless: Vec<String>,
-    exclusions: usize,
-    /// For a **polygon** die: which boundary segment each slot came from. `None` for the ordinary
-    /// four-edge case. Sections are cut per segment, so this is not optional detail — it is how a
-    /// polygon's slot list is divided at all.
-    on_segment: Option<Vec<usize>>,
-}
+use vyges_ppl::session::Prepared;
 
 fn prepare(opts: &Opts) -> Result<Prepared, String> {
     let hor = layer_list(opts, "hor-layers");
@@ -355,16 +320,6 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
     if dbu <= 0 {
         return Err("no DBU scale".into());
     }
-
-    // Upstream reaches this through a type named `Core`, but it is built from the DIE area — see
-    // `Boundary`. Reading the core area here would inset every pin by the core-to-die margin.
-    let boundary = Boundary {
-        x0: db.block_get_die_area_x_min(),
-        y0: db.block_get_die_area_y_min(),
-        x1: db.block_get_die_area_x_max(),
-        y1: db.block_get_die_area_y_max(),
-    };
-
     let params = Params {
         // In tracks it is a raw count; otherwise a length in microns. Not converting the
         // in-tracks form is the whole point of the flag.
@@ -382,154 +337,12 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
         thickness_multiplier_v: multiplier(opts, "ver-multiplier")?,
     };
 
-    let read = |names: &[String], vertical: bool| -> Result<Vec<LayerTracks>, String> {
-        names.iter().map(|l| read_layer(&db, l, vertical)).collect()
-    };
-    let ver_tracks = read(&ver, true)?;
-    let hor_tracks = read(&hor, false)?;
-
-    // What the design has already ruled out. Both are read from the block, like constraints:
-    // regions the design excluded outright, and the metal of ports already fixed in place.
-    let die = (boundary.x0, boundary.y0, boundary.x1, boundary.y1);
-    let exclusions: Vec<vyges_ppl::Interval> = db
-        .blocked_regions_for_pins()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|r| interval_from_rect(r, die))
-        .collect();
-    // `IOPlacer::getBlockedRegions`: the placed macros (every layer), then each routing obstruction
-    // and each power-grid shape (its own layer) — see `vyges_ppl::blocked`.
-    let mut exclusions = exclusions;
-    for inst in db.block_get_insts() {
-        let master = db.inst_get_master(&inst);
-        if !(db.master_is_block(&master) && db.inst_is_placed(&inst)) {
-            continue;
-        }
-        if let Ok(b) = db.inst_bbox(&inst) {
-            if let [x0, y0, x1, y1] = b[..] {
-                let clipped = (x0.max(die.0), y0.max(die.1), x1.min(die.2), y1.min(die.3));
-                exclusions.extend(vyges_ppl::blocked::find_blocked_intervals(die, clipped));
-            }
-        }
-    }
-    let mfg = db.tech_get_manufacturing_grid();
     // `set_pin_length -hor_length/-ver_length` (microns, to database units as `microns_to_dbu`
     // does): it replaces the pin's depth, so it also deepens every keep-out the pin is measured
     // against. Not stored in the database, so it arrives as a flag.
     let user_length = |key: &str| -> Result<Option<i32>, String> { Ok(Some(microns(opts, key, dbu, -1)?).filter(|v| *v != -1)) };
     let (hor_length, ver_length) = (user_length("hor-length")?, user_length("ver-length")?);
-    let directions: std::collections::HashMap<String, String> = db.layers_with_direction().unwrap_or_default().into_iter().collect();
-    // `IOPlacer::computePinKeepout`: a shape grown by the pin a slot on its layer would hold, plus
-    // the spacing the layer asks between the two (`computeShapeSpacing`).
-    // `VYGES_PPL_BOUNDARY_TRACE`: the reference's own call sequence, line for line as
-    // `instruments/ppl/ppl-boundary-patch.py` prints it, so the two diff directly.
-    let trace = std::env::var_os("VYGES_PPL_BOUNDARY_TRACE").is_some();
-    let compute_pin_keepout = |layer: &str, s: &vyges_opendb::RuledShape| {
-        let b = s.rect;
-        let vertical = directions.get(layer).is_some_and(|d| d == "VERTICAL");
-        let multiplier = if vertical { params.thickness_multiplier_v } else { params.thickness_multiplier_h };
-        let user_length = if vertical { ver_length } else { hor_length };
-        let layer_width = db.layer_get_width(layer) as i32;
-        let (half_width, height) = vyges_ppl::blocked::pin_size(layer_width, db.layer_get_area(layer).unwrap_or(0), multiplier, user_length, mfg);
-        let spacing = vyges_ppl::blocked::shape_spacing(b, s.min_spacing, s.effective_width, 2 * half_width, height, layer_width, |w, l| {
-            db.layer_get_spacing_width_length(layer, w, l)
-        });
-        let k = vyges_ppl::blocked::pin_keepout(b, vertical, half_width, height, spacing);
-        if trace {
-            eprintln!(
-                "VYGPPL keepout|{layer}|{} {} {} {}|{}|{}|{half_width}|{height}|{spacing}|{} {} {} {}",
-                b.0, b.1, b.2, b.3, s.min_spacing, s.effective_width, k.0, k.1, k.2, k.3
-            );
-        }
-        k
-    };
-    let mut layered: Vec<(vyges_ppl::Interval, String)> = Vec::new();
-    // `IOPlacer::excludeBoundaryShape`.
-    let mut exclude_boundary_shape = |s: &vyges_opendb::RuledShape| {
-        let layer = db.layer_name_by_number(s.layer);
-        if db.layer_get_routing_level(&layer) == 0 {
-            return;
-        }
-        let vertical = directions.get(&layer).is_some_and(|d| d == "VERTICAL");
-        if !(ver.is_empty() && hor.is_empty()) && !(if vertical { &ver } else { &hor }).contains(&layer) {
-            return;
-        }
-        let keepout = compute_pin_keepout(&layer, s);
-        for i in vyges_ppl::blocked::boundary_shape_intervals(die, keepout, vertical) {
-            if trace {
-                // The reference's `Edge` numbering: top, bottom, left, right.
-                let e = match i.edge {
-                    vyges_ppl::Edge::Top => 0,
-                    vyges_ppl::Edge::Bottom => 1,
-                    vyges_ppl::Edge::Left => 2,
-                    vyges_ppl::Edge::Right => 3,
-                    vyges_ppl::Edge::Invalid => 4,
-                };
-                eprintln!("VYGPPL interval|{layer}|{e}|{}|{}", i.begin, i.end);
-            }
-            layered.push((i, layer.clone()));
-        }
-    };
-    // `getBlockedRegionsFromDbObstructions`: every obstruction but the system-reserved ones (the
-    // outside of a polygon die) and the fill / slot ones (routing metal may run over those), each
-    // with the DEF spacing rules it carries.
-    for o in db.obstruction_shapes_with_rules().unwrap_or_default() {
-        if o.system_reserved || o.fill || o.slot {
-            continue;
-        }
-        if trace {
-            let (s, b) = (&o.shape, o.shape.rect);
-            eprintln!("VYGPPL shape|obs|{}|{} {} {} {}|{}|{}", db.layer_name_by_number(s.layer), b.0, b.1, b.2, b.3, s.min_spacing, s.effective_width);
-        }
-        exclude_boundary_shape(&o.shape);
-    }
-    // `getBlockedRegionsFromPDN`: a power-grid shape carries no DEF rule (`{rect}`, both -1).
-    for (l, x0, y0, x1, y1) in db.swire_boxes().unwrap_or_default() {
-        let s = vyges_opendb::RuledShape { layer: l, rect: (x0, y0, x1, y1), min_spacing: -1, effective_width: -1 };
-        exclude_boundary_shape(&s);
-    }
-    // `initNetlist` → `addFixedPinKeepouts`: for a term whose FIRST pin is fixed, each bpin that is
-    // itself fixed (a multi-bpin term can mix statuses), each box on a routing layer, kept PADDED
-    // by `computePinKeepout` with the bpin's own DEF rules, "so the pins created near them keep
-    // the min spacing". No direction-layer filter here.
-    let fixed_shapes: Vec<(String, i32, i32, i32, i32)> = db
-        .bpin_shapes_with_rules()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.term_fixed)
-        .filter_map(|p| {
-            let layer = db.layer_name_by_number(p.shape.layer);
-            if db.layer_get_routing_level(&layer) == 0 {
-                return None;
-            }
-            let k = compute_pin_keepout(&layer, &p.shape);
-            Some((layer, k.0, k.1, k.2, k.3))
-        })
-        .collect();
-
-    // A rectilinear die takes a different path entirely: its boundary is a list of segments, not
-    // four named edges. The point count is the reference's own branch condition.
-    let outline = db.die_area_polygon().unwrap_or_default();
-    let (mut slots, on_segment) = if polygon::is_polygon(&outline) {
-        let (s, seg) =
-            polygon::define_slots(&outline, &ver_tracks, &hor_tracks, &params, dbu, &|_, _, _| false);
-        (s, Some(seg))
-    } else {
-        // A slot's edge is not passed to the callback, so blocking is resolved per edge afterwards
-        // — `define_slots` knows the edge, and it is what decides which axis an exclusion compares.
-        (define_slots(&ver_tracks, &hor_tracks, boundary, &params, dbu, &|_, _, _| false), None)
-    };
-    for s in slots.iter_mut() {
-        s.blocked = is_blocked(s.x, s.y, &s.layer, s.edge, &exclusions, &fixed_shapes, &layered);
-    }
-    let trackless = ver_tracks
-        .iter()
-        .chain(hor_tracks.iter())
-        .filter(|t| t.patterns.is_empty())
-        .map(|t| t.layer.clone())
-        .collect();
-
-    Ok(Prepared { exclusions: exclusions.len(), on_segment, db, boundary, dbu, slots, trackless })
+    vyges_ppl::session::prepare_slots(db, &vyges_ppl::session::SlotArgs { hor, ver, params, hor_length, ver_length })
 }
 
 /// The IO pins to place, and where each one's net actually pulls it.

@@ -49,6 +49,7 @@ pub mod constraints;
 pub mod groups;
 pub mod hungarian;
 pub mod sections;
+pub mod session;
 pub mod polygon;
 pub mod report;
 pub mod rng;
