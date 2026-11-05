@@ -28,9 +28,12 @@
 ///
 /// Fully specified by its own definition, so there is no implementation freedom to get wrong —
 /// unlike the distributions built on top of it.
+#[derive(Clone)]
 pub struct Mt19937 {
     state: [u32; 624],
     index: usize,
+    /// Outputs drawn so far — the trace's `draws`, where two streams first part.
+    draws: u64,
 }
 
 impl Mt19937 {
@@ -42,7 +45,7 @@ impl Mt19937 {
                 .wrapping_mul(state[i - 1] ^ (state[i - 1] >> 30))
                 .wrapping_add(i as u32);
         }
-        Mt19937 { state, index: 624 }
+        Mt19937 { state, index: 624, draws: 0 }
     }
 
     fn twist(&mut self) {
@@ -59,6 +62,7 @@ impl Mt19937 {
 
     /// The next raw 32-bit output.
     pub fn next_u32(&mut self) -> u32 {
+        self.draws += 1;
         if self.index >= 624 {
             self.twist();
         }
@@ -68,6 +72,11 @@ impl Mt19937 {
         y ^= (y << 7) & 0x9d2c_5680;
         y ^= (y << 15) & 0xefc6_0000;
         y ^ (y >> 18)
+    }
+
+    /// How many outputs this engine has produced.
+    pub fn draws(&self) -> u64 {
+        self.draws
     }
 
     /// The engine's span, `max - min`. Every distribution below is defined in terms of it.

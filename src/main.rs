@@ -158,7 +158,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
       "input_hash covers the argument vector, not the content of the .odb it names.",
       "SCOPE: this build implements slot generation, EXCLUDED REGIONS (`exclude_io_pin_region`), REGION CONSTRAINTS (`set_io_pin_constraint -region edge:lo-hi`, by pin name or by direction), PIN GROUPS (`-group`/`-order`, including fallback placement for groups too large for a section), MIRRORED PIN PAIRS (`-mirrored_pins`), ports already fixed by `place_pin`, and the deterministic assignment of the remaining pins -- sections plus optimal (Hungarian) matching within each section. TOP-LAYER placement (`define_pin_shape_pattern` + `-region up:`), and the deterministic assignment of the rest. POLYGON (rectilinear) dies, SIMULATED ANNEALING for plain pins, and the deterministic assignment of the rest.",
-      "ANNEALING (`--annealing`) reproduces the reference EXACTLY, including its random stream: the reference draws from Boost, whose algorithms are specified and portable, so the engine, both distributions and the shuffle are reimplemented bit-for-bit. Verified by comparing all 86000 perturbations of a run against the reference own debug trace -- every cost and delta identical. Scope: plain pins only. A design with groups, constraints or mirrored pairs is REFUSED rather than annealed, because those add move types whose draws would desynchronise the stream and yield a plausible wrong answer.",
+      "ANNEALING (`--annealing`) reproduces the reference EXACTLY, including its random stream: the reference draws from Boost, whose algorithms are specified and portable, so the engine, both distributions and the shuffle are reimplemented bit-for-bit. Verified by comparing all 86000 perturbations of a run against the reference own debug trace -- every cost and delta identical. Scope: the whole reference annealer -- region constraints (unsorted, as an annealing run reads them), pin groups with all four group moves, and mirrored pairs; verified on every one of upstream 31 annealing cases, perturbation by perturbation, against an instrumented reference. A pin sent to the top layer is the one case still declined: the reference anneals boundary slots only.",
       "⚠️ The committed annealing goldens in the reference test suite are STALE: a live run of the pinned build disagrees with `annealing1.defok` on 49 of 54 pins. Compare annealing against a live run, never against those files.",
       "A POLYGON die has no named edges, so its boundary is handled as a list of segments: an edge is a segment, its direction comes from the order of its endpoints, and sections are cut per segment. Five points is a RECTANGLE (the ring repeats its first point); more than five takes the polygon path. LIMITATION: edge-named region constraints (`-region bottom:...`) are REPORTED AND IGNORED on a polygon die rather than reinterpreted against the bounding box, which would satisfy a constraint the design did not ask for.",
       "TOP-LAYER pins are placed on a 2-D lattice INSIDE the die rather than on its boundary, so almost none of the edge rules apply to them: there is no direction to order a group along and no opposite side to mirror to. A lattice position is legal only if a pin of the declared size FITS there -- inside the die, and clear of routing blockages, the power grid and fixed ports on that layer by at least the keepout. Non-rectangular grid regions are not handled.",
@@ -455,8 +455,12 @@ fn place_pins(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let outcome = if constraints.is_empty() && groups.is_empty() {
-            annealing::run(&p.slots, pins, die, &cfg)
+        // `runAnnealing`: the constraints as `initConstraints(true)` leaves them — in the order
+        // read, unsorted — and the whole netlist annealed over the boundary slots. A pin sent to
+        // the top layer is the one thing the reference's annealer does not place.
+        let outcome = if top_set.is_empty() {
+            let regions = annealing::regions(&p.slots, &net.unsorted_constraints, groups, per_section);
+            annealing::run_with(&p.slots, pins, groups, &regions, die, &cfg)
         } else {
             Err(annealing::Unsupported::NeedsExtraMoves)
         };

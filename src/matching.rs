@@ -233,6 +233,9 @@ pub struct Netlist {
     pub groups: Vec<Group>,
     /// In the order they are served ([`crate::sort_constraints`]).
     pub constraints: Vec<Constraint>,
+    /// The same constraints in the order they are READ (`getConstraintsFromDB`), before that
+    /// sort: what an annealing run uses, since `initConstraints(true)` does not sort.
+    pub unsorted_constraints: Vec<Constraint>,
 }
 
 /// `initNetlistAndCore` + `initMirroredPins` + `initConstraints`: the pins in port order, each
@@ -268,10 +271,11 @@ pub fn init_netlist(db: &Db, die: (i32, i32, i32, i32), slots: &[Slot], per_sect
         .collect();
 
     let mut constraints = crate::collect_constraints(&pins, die, &|i| regions[i], &|i| mirrored[i]);
+    let unsorted_constraints = constraints.clone();
     // Where two regions share slots, whoever is served first takes them, so the order is part of
     // the answer rather than a detail of iteration.
     crate::sort_constraints(&mut constraints, slots, per_section);
-    Netlist { pins, groups, constraints }
+    Netlist { pins, groups, constraints, unsorted_constraints }
 }
 
 /// `printConfig`'s inputs: what the run was given, before any pin is assigned.
@@ -542,7 +546,7 @@ mod tests {
     #[test]
     fn the_displacement_line_measures_each_placed_pin_from_where_it_stood() {
         let pin = |name: &str, initial| Pin { name: name.into(), sinks: vec![], mirror: None, initial: Some(initial) };
-        let net = Netlist { pins: vec![pin("a", (0, 0)), pin("b", (500, 0)), pin("c", (900, 0))], groups: vec![], constraints: vec![] };
+        let net = Netlist { pins: vec![pin("a", (0, 0)), pin("b", (500, 0)), pin("c", (900, 0))], groups: vec![], constraints: vec![], unsorted_constraints: vec![] };
         // a stays; b moves 300 + 100; c is not placed and is not counted.
         let line = displacement_line(&net, &[placed(0, 0, 0), placed(1, 200, 100)], 100);
         assert_eq!(line, "Moved 1 of 2 pins, mean 4.00 um, max 4.00 um.");
