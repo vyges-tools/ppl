@@ -48,6 +48,10 @@ pub struct Pin {
     /// compete at all: it is placed at the mirrored position of whatever this pin gets, so giving
     /// both a say would let them disagree.
     pub mirror: Option<usize>,
+    /// `IOPin::getInitialPosition` — where the port's first placed pin stands (its box centre) —
+    /// in a run that minimises displacement (`Netlist::setMinimizeDisplacement`); `None` in any
+    /// other run. Set on every pin of a run or on none: it is the run's mode as well as the point.
+    pub initial: Option<(i32, i32)>,
 }
 
 /// **M1** — reflect a position to the opposite edge.
@@ -87,9 +91,9 @@ pub fn mirrored_edge(edge: Edge) -> Edge {
 /// plus its partner's at the reflected position. Costing only the competing pin would optimise
 /// half a pair and let the other half land wherever the reflection happened to fall.
 pub fn pin_cost(pins: &[Pin], idx: usize, at: (i32, i32), die: (i32, i32, i32, i32)) -> i64 {
-    let own = net_hpwl(&pins[idx].sinks, at);
+    let own = io_net_cost(&pins[idx], at);
     match pins[idx].mirror {
-        Some(m) => own + net_hpwl(&pins[m].sinks, mirrored_position(at, die)),
+        Some(m) => own + io_net_cost(&pins[m], mirrored_position(at, die)),
         None => own,
     }
 }
@@ -100,11 +104,42 @@ pub fn pin_cost(pins: &[Pin], idx: usize, at: (i32, i32), die: (i32, i32, i32, i
 /// Used only to break ties. Two positions with the same total can split it evenly or lopsidedly,
 /// and the even split is the better placement.
 pub fn pin_balance(pins: &[Pin], idx: usize, at: (i32, i32), die: (i32, i32, i32, i32)) -> i64 {
-    let own = net_hpwl(&pins[idx].sinks, at);
+    let own = io_net_cost(&pins[idx], at);
     match pins[idx].mirror {
-        Some(m) => own.max(net_hpwl(&pins[m].sinks, mirrored_position(at, die))),
+        Some(m) => own.max(io_net_cost(&pins[m], mirrored_position(at, die))),
         None => own,
     }
+}
+
+/// `Netlist::computeIONetHPWL`: what a position costs a pin — the Manhattan distance from where
+/// it stands when the run minimises displacement, else its net's half-perimeter ([`net_hpwl`]).
+/// (`reportHPWL`, PPL-0012, measures the net's box in either mode: [`net_hpwl`] directly.)
+pub fn io_net_cost(pin: &Pin, at: (i32, i32)) -> i64 {
+    match pin.initial {
+        Some((x, y)) => i64::from((at.0 - x).abs()) + i64::from((at.1 - y).abs()),
+        None => net_hpwl(&pin.sinks, at),
+    }
+}
+
+/// `IOPlacer::nearestFreeSlot`: the section's free slot nearest a point (the first of a tie), the
+/// section's own position when none is free or the section is a top-layer one (edge `Invalid`).
+pub fn nearest_free_slot(section: &Section, slots: &[Slot], p: (i32, i32)) -> (i32, i32) {
+    if section.edge == Edge::Invalid {
+        return section.pos;
+    }
+    let mut best = section.pos;
+    let mut best_dist = i64::MAX;
+    for s in &slots[section.begin_slot..=section.end_slot] {
+        if s.blocked {
+            continue;
+        }
+        let d = i64::from((s.x - p.0).abs()) + i64::from((s.y - p.1).abs());
+        if d < best_dist {
+            best_dist = d;
+            best = (s.x, s.y);
+        }
+    }
+    best
 }
 
 /// **H1** — the cost of putting a pin at a position: the half-perimeter of the box enclosing the
@@ -197,6 +232,7 @@ pub fn assign_pins_to_sections(
     pins: &[Pin],
     which: &[usize],
     sections: &mut [Section],
+    slots: &[Slot],
     die: (i32, i32, i32, i32),
 ) -> Vec<usize> {
     let mut unplaced = Vec::new();
@@ -216,9 +252,15 @@ pub fn assign_pins_to_sections(
         let keys: Vec<(i64, i64, usize)> = sections
             .iter()
             .map(|s| {
-                let cost = pin_cost(pins, idx, s.pos, die);
+                // `assignPinToSection`: a displacement-minimising run measures a section from its
+                // free slot nearest the pin, not from its middle slot
+                let pos = match pins[idx].initial {
+                    Some(p) => nearest_free_slot(s, slots, p),
+                    None => s.pos,
+                };
+                let cost = pin_cost(pins, idx, pos, die);
                 match pins[idx].mirror {
-                    Some(_) => (cost, pin_balance(pins, idx, s.pos, die), s.used_slots),
+                    Some(_) => (cost, pin_balance(pins, idx, pos, die), s.used_slots),
                     None => (cost, 0, 0),
                 }
             })
@@ -490,7 +532,7 @@ pub fn place(
     let partners: std::collections::BTreeSet<usize> = pins.iter().filter_map(|p| p.mirror).collect();
     let singles: Vec<usize> =
         (0..pins.len()).filter(|p| !grouped.contains(p) && !partners.contains(p)).collect();
-    unplaced.extend(assign_pins_to_sections(pins, &singles, &mut sections, die));
+    unplaced.extend(assign_pins_to_sections(pins, &singles, &mut sections, &slots, die));
 
     let (placed, missed) = solve_sections(&mut slots, &sections, pins, groups, &members, die);
     unplaced.extend(missed);
@@ -521,7 +563,81 @@ mod tests {
     }
 
     fn pin(name: &str, sinks: &[(i32, i32)]) -> Pin {
-        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None }
+        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None, initial: None }
+    }
+
+    // Rule (Netlist::computeIONetHPWL): a displacement-minimising run costs a position by its
+    // Manhattan distance from where the pin stands, whatever its net; otherwise by the net's
+    // half-perimeter. A mirrored pin's partner is costed the same way at the reflection.
+    #[test]
+    fn displacement_replaces_wirelength_as_the_cost() {
+        let mut p = pin("a", &[(0, 0)]);
+        assert_eq!(io_net_cost(&p, (300, 400)), 700, "wirelength: the net's box");
+        p.initial = Some((100, 100));
+        assert_eq!(io_net_cost(&p, (300, 400)), 500, "displacement: |300-100| + |400-100|");
+        assert_eq!(io_net_cost(&p, (100, 100)), 0, "where it stands costs nothing");
+        let die = (0, 0, 1000, 1000);
+        let pins = vec![
+            Pin { name: "a".into(), sinks: vec![], mirror: Some(1), initial: Some((0, 500)) },
+            Pin { name: "b".into(), sinks: vec![], mirror: None, initial: Some((1000, 300)) },
+        ];
+        assert_eq!(pin_cost(&pins, 0, (0, 400), die), 100 + 100, "own 100 plus the partner's 100 at (1000, 400)");
+    }
+
+    // Rule (IOPlacer::assignPinToSection / assignGroupToSection's tie-break, `larger_cost =
+    // max(computeIONetHPWL(pin, pos), getMirroredPinCost(pin, pos))`, where getMirroredPinCost is
+    // computeIONetHPWL of the PARTNER at the reflected position): a mirrored pair's balance is the
+    // larger of its two halves, and in a displacement-minimising run the partner's half is the
+    // partner's displacement — not its net's wirelength — exactly as the pin's own half is.
+    #[test]
+    fn a_mirrored_partner_is_balanced_by_its_own_displacement() {
+        let die = (0, 0, 1000, 1000);
+        // The partner has no sinks: costed by its net it would be 0 everywhere.
+        let pins = vec![
+            Pin { name: "a".into(), sinks: vec![], mirror: Some(1), initial: Some((0, 500)) },
+            Pin { name: "b".into(), sinks: vec![], mirror: None, initial: Some((1000, 300)) },
+        ];
+        assert_eq!(pin_balance(&pins, 0, (0, 200), die), 300, "the larger half: own 300, partner's 100");
+        assert_eq!(pin_balance(&pins, 0, (0, 500), die), 200, "the larger half is the partner's: 200 from (1000, 300)");
+    }
+
+    // Rule (IOPlacer::nearestFreeSlot): a section is measured from its free slot nearest the point
+    // — the first of a tie, blocked slots skipped — and from its own position when it has no free
+    // slot or is a top-layer section (edge invalid).
+    #[test]
+    fn a_section_is_measured_from_its_nearest_free_slot() {
+        let mut slots = bottom_row(10);
+        let sec = Section { pos: (500, 0), num_slots: 10, used_slots: 0, begin_slot: 0, end_slot: 9, edge: Edge::Bottom, pins: vec![] };
+        assert_eq!(nearest_free_slot(&sec, &slots, (210, 50)), (200, 0));
+        assert_eq!(nearest_free_slot(&sec, &slots, (250, 0)), (200, 0), "a tie: the first");
+        slots[2].blocked = true;
+        assert_eq!(nearest_free_slot(&sec, &slots, (210, 50)), (300, 0), "a blocked slot is skipped: 300 is 140 away, 100 is 160");
+        for s in slots.iter_mut() {
+            s.blocked = true;
+        }
+        assert_eq!(nearest_free_slot(&sec, &slots, (210, 50)), (500, 0), "nothing free: the section's own position");
+        let top = Section { edge: Edge::Invalid, ..sec };
+        assert_eq!(nearest_free_slot(&top, &bottom_row(10), (210, 50)), (500, 0), "a top-layer section");
+    }
+
+    // Rule (assignPinToSection): in a displacement-minimising run a pin takes the section whose
+    // nearest free slot is nearest where it stands, not the one whose middle slot is.
+    #[test]
+    fn a_displacement_minimising_pin_takes_the_section_nearest_where_it_stands() {
+        let slots = bottom_row(20);
+        let mk = |b: usize, e: usize| Section { pos: (slots[(b + e) / 2].x, slots[(b + e) / 2].y), num_slots: e - b + 1, used_slots: 0, begin_slot: b, end_slot: e, edge: Edge::Bottom, pins: vec![] };
+        // section 0: slots 0..=9, middle at 400; section 1: slots 10..=19, middle at 1400. The pin
+        // stands at 950: section 0's middle is 550 away and section 1's 450, but section 0's slot
+        // 900 is 50 away and section 1's slot 1000 is 50 away too — a tie, and the first wins.
+        let mut sections = vec![mk(0, 9), mk(10, 19)];
+        let pins = vec![Pin { name: "a".into(), sinks: vec![(5000, 0)], mirror: None, initial: Some((950, 0)) }];
+        assert!(assign_pins_to_sections(&pins, &[0], &mut sections, &slots, (0, 0, 2000, 1000)).is_empty());
+        assert_eq!(sections[0].pins, vec![0], "nearest free slot, not the middle slot, and not the net");
+        let mut sections = vec![mk(0, 9), mk(10, 19)];
+        let mut plain = pins.clone();
+        plain[0].initial = None;
+        assign_pins_to_sections(&plain, &[0], &mut sections, &slots, (0, 0, 2000, 1000));
+        assert_eq!(sections[1].pins, vec![0], "wirelength: the middle slot nearer the sink");
     }
 
     #[test]
@@ -593,7 +709,7 @@ mod tests {
         let (left_mid, right_mid) = (sections[0].pos.0, sections[1].pos.0);
 
         let pins = vec![pin("a", &[(right_mid, 500)]), pin("b", &[(left_mid, 500)])];
-        assert!(assign_pins_to_sections(&pins, &all(&pins), &mut sections, (0, 0, 10_000, 10_000)).is_empty());
+        assert!(assign_pins_to_sections(&pins, &all(&pins), &mut sections, &slots, (0, 0, 10_000, 10_000)).is_empty());
         assert_eq!(sections[1].pins, vec![0], "pin a went right, where its net is");
         assert_eq!(sections[0].pins, vec![1], "pin b went left");
     }
@@ -607,7 +723,7 @@ mod tests {
         // Every pin wants section 0, which holds two.
         let want = sections[0].pos;
         let pins: Vec<Pin> = (0..3).map(|i| pin(&format!("p{i}"), &[want])).collect();
-        let unplaced = assign_pins_to_sections(&pins, &all(&pins), &mut sections, (0, 0, 10_000, 10_000));
+        let unplaced = assign_pins_to_sections(&pins, &all(&pins), &mut sections, &slots, (0, 0, 10_000, 10_000));
         assert!(unplaced.is_empty());
         assert_eq!(sections[0].pins, vec![0, 1], "first two take it");
         assert_eq!(sections[1].pins, vec![2], "the third is pushed on");
@@ -618,7 +734,7 @@ mod tests {
         let slots = bottom_row(2);
         let mut sections = find_sections(&slots, 0, 1, Edge::Bottom, 200);
         let pins: Vec<Pin> = (0..5).map(|i| pin(&format!("p{i}"), &[])).collect();
-        let unplaced = assign_pins_to_sections(&pins, &all(&pins), &mut sections, (0, 0, 10_000, 10_000));
+        let unplaced = assign_pins_to_sections(&pins, &all(&pins), &mut sections, &slots, (0, 0, 10_000, 10_000));
         assert_eq!(unplaced, vec![2, 3, 4], "three pins had nowhere to go");
     }
 
@@ -713,8 +829,8 @@ mod tests {
         // the reflection happened to fall.
         let die = (0, 0, 1000, 1000);
         let pins = vec![
-            Pin { name: "a".into(), sinks: vec![(0, 500)], mirror: Some(1) },
-            Pin { name: "b".into(), sinks: vec![(1000, 500)], mirror: None },
+            Pin { name: "a".into(), sinks: vec![(0, 500)], mirror: Some(1), initial: None },
+            Pin { name: "b".into(), sinks: vec![(1000, 500)], mirror: None, initial: None },
         ];
         // Put `a` on the left: it is on top of its own net, and `b` lands on the right, on top of
         // its net too. Both halves are cheap.
@@ -735,17 +851,18 @@ mod tests {
         let die = (0, 0, 1000, 1000);
         // On the bottom edge at x in [0, 600] the pair costs 600 in total; the halves are x and 600 - x.
         let pins = vec![
-            Pin { name: "a".into(), sinks: vec![(0, 0)], mirror: Some(1) },
-            Pin { name: "b".into(), sinks: vec![(600, 1000)], mirror: None },
+            Pin { name: "a".into(), sinks: vec![(0, 0)], mirror: Some(1), initial: None },
+            Pin { name: "b".into(), sinks: vec![(600, 1000)], mirror: None, initial: None },
         ];
         let sec = |x: i32, used: usize| Section { pos: (x, 0), num_slots: 10, used_slots: used, begin_slot: 0, end_slot: 9, edge: Edge::Bottom, pins: vec![] };
+        let slots = bottom_row(10); // not consulted: no pin of a wirelength run has a position
         let mut sections = vec![sec(100, 0), sec(300, 0)];
         assert_eq!(pin_cost(&pins, 0, (100, 0), die), pin_cost(&pins, 0, (300, 0), die), "a cost tie");
-        assign_pins_to_sections(&pins, &[0], &mut sections, die);
+        assign_pins_to_sections(&pins, &[0], &mut sections, &slots, die);
         assert_eq!((sections[0].pins.len(), sections[1].pins.len()), (0, 1), "the even split (x = 300)");
         // Equal cost and equal balance (x = 200 and 400 mirror each other's halves): the emptier one.
         let mut sections = vec![sec(200, 3), sec(400, 1)];
-        assign_pins_to_sections(&pins, &[0], &mut sections, die);
+        assign_pins_to_sections(&pins, &[0], &mut sections, &slots, die);
         assert_eq!((sections[0].pins.len(), sections[1].pins.len()), (0, 1), "the emptier section");
     }
 
@@ -754,8 +871,8 @@ mod tests {
         // Two positions can share a total and split it very differently; the even split is better.
         let die = (0, 0, 1000, 1000);
         let pins = vec![
-            Pin { name: "a".into(), sinks: vec![(0, 0)], mirror: Some(1) },
-            Pin { name: "b".into(), sinks: vec![(1000, 0)], mirror: None },
+            Pin { name: "a".into(), sinks: vec![(0, 0)], mirror: Some(1), initial: None },
+            Pin { name: "b".into(), sinks: vec![(1000, 0)], mirror: None, initial: None },
         ];
         let at = (0, 500);
         assert_eq!(
@@ -784,8 +901,8 @@ mod tests {
             Slot { x: 1000, y: 300, layer: "m1".into(), edge: Edge::Right, blocked: false },
         ];
         let pins = vec![
-            Pin { name: "a".into(), sinks: vec![], mirror: Some(1) },
-            Pin { name: "b".into(), sinks: vec![], mirror: None },
+            Pin { name: "a".into(), sinks: vec![], mirror: Some(1), initial: None },
+            Pin { name: "b".into(), sinks: vec![], mirror: None, initial: None },
         ];
         let (added, failed) =
             expand_mirrors(&mut slots, &pins, &[Placement { pin: 0, slot: 0 }], die);
@@ -801,8 +918,8 @@ mod tests {
         let mut slots =
             vec![Slot { x: 0, y: 300, layer: "m1".into(), edge: Edge::Left, blocked: false }];
         let pins = vec![
-            Pin { name: "a".into(), sinks: vec![], mirror: Some(1) },
-            Pin { name: "b".into(), sinks: vec![], mirror: None },
+            Pin { name: "a".into(), sinks: vec![], mirror: Some(1), initial: None },
+            Pin { name: "b".into(), sinks: vec![], mirror: None, initial: None },
         ];
         let (added, failed) =
             expand_mirrors(&mut slots, &pins, &[Placement { pin: 0, slot: 0 }], die);
@@ -819,11 +936,11 @@ mod tests {
         let mut sections = find_sections(&slots, 0, 1, Edge::Bottom, 200);
         sections[0].num_slots = 1;
         let pins = vec![
-            Pin { name: "free".into(), sinks: vec![], mirror: None },
-            Pin { name: "pair".into(), sinks: vec![], mirror: Some(2) },
-            Pin { name: "partner".into(), sinks: vec![], mirror: None },
+            Pin { name: "free".into(), sinks: vec![], mirror: None, initial: None },
+            Pin { name: "pair".into(), sinks: vec![], mirror: Some(2), initial: None },
+            Pin { name: "partner".into(), sinks: vec![], mirror: None, initial: None },
         ];
-        let unplaced = assign_pins_to_sections(&pins, &all(&pins), &mut sections, die);
+        let unplaced = assign_pins_to_sections(&pins, &all(&pins), &mut sections, &slots, die);
         assert_eq!(sections[0].pins, vec![1], "the mirrored pin chose first");
         assert!(unplaced.contains(&0));
     }

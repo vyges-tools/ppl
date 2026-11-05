@@ -296,7 +296,7 @@ mod tests {
     fn a_rectangle_with_area_is_a_top_layer_pin_and_a_flat_one_is_not() {
         // The same command declares both kinds; only the shape tells them apart.
         let pins: Vec<Pin> = (0..3)
-            .map(|i| Pin { name: format!("p{i}"), sinks: vec![], mirror: None })
+            .map(|i| Pin { name: format!("p{i}"), sinks: vec![], mirror: None, initial: None })
             .collect();
         let region = |i: usize| match i {
             0 => Some((10, 10, 90, 90)),   // area: top layer

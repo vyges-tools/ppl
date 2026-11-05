@@ -376,7 +376,7 @@ fn read_pins(db: &Db, center: (i32, i32)) -> Vec<Pin> {
                 sinks.push(p);
             }
         }
-        out.push(Pin { name, sinks, mirror: None });
+        out.push(Pin { name, sinks, mirror: None, initial: None });
     }
     out
 }
@@ -529,6 +529,7 @@ fn place_pins(args: &[String]) -> ExitCode {
         ios_without_sink: pins.iter().filter(|pin| p.db.net_iterms(&p.db.bterm_net(&pin.name)).is_empty()).count(),
         groups: groups.len(),
         slots_per_section: (!opts.annealing).then_some(per_section),
+        minimize_displacement: false,
     };
     for line in vyges_ppl::report::config(&config) {
         log.info(line);
@@ -923,6 +924,7 @@ fn place_top_layer(
             pins,
             &members,
             &mut sections,
+            &slots,
             (0, 0, 0, 0),
         ));
         let (p, u) = vyges_ppl::solve_sections(

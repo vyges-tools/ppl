@@ -48,7 +48,7 @@
 //! Nothing here touches a database.
 
 use crate::rng::Mt19937;
-use crate::sections::{net_hpwl, Pin, Placement};
+use crate::sections::{Pin, Placement};
 use crate::slots::Slot;
 
 /// The knobs `set_simulated_annealing` exposes, with the reference's defaults.
@@ -163,7 +163,7 @@ impl<'a> State<'a> {
 
     fn pin_cost(&self, pin: usize) -> i64 {
         let s = &self.slots[self.assignment[pin]];
-        net_hpwl(&self.pins[pin].sinks, (s.x, s.y))
+        crate::sections::io_net_cost(&self.pins[pin], (s.x, s.y))
     }
 
     fn total_cost(&self) -> i64 {
@@ -355,6 +355,7 @@ impl<'a> State<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sections::net_hpwl;
     use crate::slots::Edge;
 
     fn slots(n: usize) -> Vec<Slot> {
@@ -370,7 +371,7 @@ mod tests {
     }
 
     fn pin(name: &str, sinks: &[(i32, i32)]) -> Pin {
-        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None }
+        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None, initial: None }
     }
 
     const DIE: (i32, i32, i32, i32) = (0, 0, 10_000, 10_000);
@@ -474,8 +475,8 @@ mod tests {
         // of step and produce a plausible-looking placement that is not the reference's.
         let s = slots(20);
         let mirrored = vec![
-            Pin { name: "a".into(), sinks: vec![], mirror: Some(1) },
-            Pin { name: "b".into(), sinks: vec![], mirror: None },
+            Pin { name: "a".into(), sinks: vec![], mirror: Some(1), initial: None },
+            Pin { name: "b".into(), sinks: vec![], mirror: None, initial: None },
         ];
         assert_eq!(run(&s, &mirrored, DIE, &Anneal::default()), Err(Unsupported::NeedsExtraMoves));
     }

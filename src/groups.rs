@@ -279,6 +279,69 @@ pub fn first_run(slots: &[Slot], first: usize, last: usize, size: usize) -> Opti
     None
 }
 
+/// `IOPlacer::findGroupSlotNearInitial`: in a displacement-minimising run, the start of the free
+/// run in `first..=last` where the group moves least — each pin's distance from where it stands
+/// to the slot it would take (in [`place_fallback`]'s order: reversed on the top and left edges),
+/// plus a mirrored pin's partner's distance from where it stands to the reflection; the first of
+/// a tie. With `check_mirrored` a slot is free only when the slot at its reflection (same layer)
+/// is free too. `None` when no run is long enough.
+pub fn find_group_slot_near_initial(
+    slots: &[Slot],
+    pins: &[Pin],
+    group: &[usize],
+    first: usize,
+    last: usize,
+    check_mirrored: bool,
+    die: (i32, i32, i32, i32),
+) -> Option<usize> {
+    let mut slot_at: std::collections::HashMap<(&str, i32, i32), usize> = std::collections::HashMap::new();
+    if check_mirrored {
+        for (i, s) in slots.iter().enumerate() {
+            slot_at.entry((s.layer.as_str(), s.x, s.y)).or_insert(i);
+        }
+    }
+    let available = |s: usize| {
+        if slots[s].blocked {
+            return false;
+        }
+        if !check_mirrored {
+            return true;
+        }
+        let (mx, my) = crate::sections::mirrored_position((slots[s].x, slots[s].y), die);
+        slot_at.get(&(slots[s].layer.as_str(), mx, my)).is_some_and(|&m| !slots[m].blocked)
+    };
+    let initial = |p: usize| pins[p].initial.expect("a displacement-minimising run gives every pin its position");
+    let dist = |a: (i32, i32), b: (i32, i32)| i64::from((a.0 - b.0).abs()) + i64::from((a.1 - b.1).abs());
+    let size = group.len();
+    let mut best = None;
+    let mut best_cost = i64::MAX;
+    let mut free_run = 0;
+    for s in first..=last {
+        free_run = if available(s) { free_run + 1 } else { 0 };
+        if free_run < size {
+            continue;
+        }
+        let start = s + 1 - size;
+        let reverse = matches!(slots[start].edge, Edge::Top | Edge::Left);
+        let mut cost = 0i64;
+        let mut i = 0;
+        while i < size && cost < best_cost {
+            let p = group[if reverse { size - 1 - i } else { i }];
+            let to = (slots[start + i].x, slots[start + i].y);
+            cost += dist(to, initial(p));
+            if let Some(m) = pins[p].mirror {
+                cost += dist(crate::sections::mirrored_position(to, die), initial(m));
+            }
+            i += 1;
+        }
+        if cost < best_cost {
+            best_cost = cost;
+            best = Some(start);
+        }
+    }
+    best
+}
+
 /// **G6** — put an oversized group on consecutive slots from `start`, consuming them.
 ///
 /// ⚠️ **The reversal here is unconditional on the top and left edges**, unlike the matched path
@@ -302,6 +365,57 @@ pub fn place_fallback(slots: &mut [Slot], group: &Group, start: usize) -> Vec<Pl
 mod tests {
     use super::*;
 
+    fn at(name: &str, x: i32, y: i32) -> Pin {
+        Pin { name: name.into(), sinks: vec![], mirror: None, initial: Some((x, y)) }
+    }
+
+    // Rule (findGroupSlotNearInitial): the start of the free run where the group moves least —
+    // each pin's distance from where it stands to the slot it would take — the first of a tie;
+    // none when no run is long enough.
+    #[test]
+    fn a_fallback_group_goes_where_it_moves_least() {
+        let mut slots = row(10, Edge::Bottom);
+        let pins = vec![at("a", 500, 0), at("b", 600, 0)];
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0, 1], 0, 9, false, (0, 0, 900, 900)), Some(5));
+        slots[6].blocked = true;
+        // runs: 0..=5 and 7..=9; at 4 the pair moves 100 + 100, at 7 by 200 + 200
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0, 1], 0, 9, false, (0, 0, 900, 900)), Some(4));
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0, 1], 7, 9, false, (0, 0, 900, 900)), Some(7), "the window bounds it");
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0, 1, 0, 1, 0, 1, 0], 0, 9, false, (0, 0, 900, 900)), None);
+    }
+
+    // Rule (findGroupSlotNearInitial): the pins take the slots in placeFallbackGroup's order —
+    // reversed on the top and left edges — so the cost of a run is the reversed pairing there.
+    #[test]
+    fn a_fallback_group_on_the_top_edge_is_costed_reversed() {
+        let slots: Vec<Slot> = (0..4).map(|i| Slot { x: i * 100, y: 900, layer: "met1".into(), edge: Edge::Top, blocked: false }).collect();
+        // a stands at 300 and b at 200. Reversed, a run from s puts b on s and a on s + 1: from 2
+        // neither moves. In group order (a on s) the best would be s = 1 at 200.
+        let pins = vec![at("a", 300, 900), at("b", 200, 900)];
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0, 1], 0, 3, false, (0, 0, 900, 900)), Some(2));
+    }
+
+    // Rule (findGroupSlotNearInitial): with a mirrored pin in the group a slot is free only when
+    // its reflection on the same layer is free too, and the partner's distance counts.
+    #[test]
+    fn a_mirrored_fallback_group_needs_its_reflection_free() {
+        let die = (0, 0, 900, 900);
+        // off the corners, so each bottom slot reflects to the top slot above it
+        let mut slots: Vec<Slot> = (1..5).map(|i| Slot { x: i * 100, y: 0, layer: "met1".into(), edge: Edge::Bottom, blocked: false }).collect();
+        slots.extend((1..5).map(|i| Slot { x: i * 100, y: 900, layer: "met1".into(), edge: Edge::Top, blocked: false }));
+        let mut pins = vec![at("a", 100, 0), at("m", 100, 900)];
+        pins[0].mirror = Some(1);
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0], 0, 3, true, die), Some(0));
+        slots[4].blocked = true; // (100, 900): slot 0's reflection
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0], 0, 3, true, die), Some(1));
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0], 0, 3, false, die), Some(0), "unchecked: the reflection is not consulted");
+        // a stands between slots 1 (200) and 2 (300), 50 from each: its partner, at (300, 900),
+        // decides — slot 2's reflection is where it stands
+        let mut pins = vec![at("a", 250, 0), at("m", 300, 900)];
+        pins[0].mirror = Some(1);
+        assert_eq!(find_group_slot_near_initial(&slots, &pins, &[0], 1, 3, true, die), Some(2), "the partner's distance counts");
+    }
+
     fn row(n: usize, edge: Edge) -> Vec<Slot> {
         (0..n)
             .map(|i| Slot { x: i as i32 * 100, y: 0, layer: "met1".into(), edge, blocked: false })
@@ -309,7 +423,7 @@ mod tests {
     }
 
     fn pin(name: &str, sinks: &[(i32, i32)]) -> Pin {
-        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None }
+        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None, initial: None }
     }
 
     fn section(begin: usize, end: usize, num_slots: usize, edge: Edge) -> Section {

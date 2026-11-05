@@ -235,7 +235,7 @@ pub fn run_round(
     // 🔑 Real pin indices throughout — never a compacted subset. A `Pin` carries the index of its
     // mirrored partner, so a renumbered copy of the pin list makes that index point at the wrong
     // pin, or off the end of a shorter one.
-    unplaced.extend(assign_pins_to_sections(pins, &singles, sections, die));
+    unplaced.extend(assign_pins_to_sections(pins, &singles, sections, slots, die));
 
     let (placed, missed) =
         crate::sections::solve_sections(slots, sections, pins, groups, &members, die);
@@ -279,11 +279,61 @@ pub fn place_with_constraints(
     // **Fallback first.** A group larger than a whole section can never be assigned to one, so it
     // is placed directly, before anything else competes for the boundary. Doing it later would
     // mean searching for a long contiguous run through a boundary already peppered with pins.
-    for (gi, g) in groups.iter().enumerate() {
-        if g.pins.len() <= slots_per_section || !g.pins.iter().all(|p| eligible.contains(p)) {
-            continue;
-        }
+    let fallback: Vec<usize> = (0..groups.len())
+        .filter(|&gi| groups[gi].pins.len() > slots_per_section && groups[gi].pins.iter().all(|p| eligible.contains(p)))
+        .collect();
+    for &gi in &fallback {
         group_done[gi] = true;
+    }
+    // A fallback group's placement, its reflections claimed beside it — the one place they can be
+    // claimed exactly once.
+    let place_at = |slots: &mut Vec<Slot>, g: &Group, at: usize, placed: &mut Vec<Placement>, unplaced: &mut Vec<usize>, done: &mut Vec<bool>| {
+        let p = crate::groups::place_fallback(slots, g, at);
+        let (mirrors, failed) = crate::sections::expand_mirrors(slots, pins, &p, die);
+        for x in p.iter().chain(mirrors.iter()) {
+            done[x.pin] = true;
+        }
+        placed.extend(p);
+        placed.extend(mirrors);
+        unplaced.extend(failed);
+    };
+    // `placeFallbackPins`: a displacement-minimising run places each group where it moves least
+    // (`placeFallbackGroupsNearInitial`, within the slots of the constraint naming the group's
+    // first pin); one group with no room undoes them all and the first fit below places every one.
+    let near = pins.first().is_some_and(|p| p.initial.is_some()) && {
+        let saved = (slots.clone(), placed.len(), unplaced.len(), done.clone());
+        let mut fits = true;
+        for &gi in &fallback {
+            let g = &groups[gi];
+            let (first, last) = constraints
+                .iter()
+                .find(|c| c.pins.contains(&g.pins[0]))
+                .and_then(|c| {
+                    let secs = sections_for(&slots, c.interval, slots_per_section);
+                    Some((secs.first()?.begin_slot, secs.last()?.end_slot))
+                })
+                .unwrap_or((0, slots.len() - 1));
+            // `isMirrored`: either half of a mirrored pair
+            let mirrored = g.pins.iter().any(|&p| pins[p].mirror.is_some() || pins.iter().any(|q| q.mirror == Some(p)));
+            match crate::groups::find_group_slot_near_initial(&slots, pins, &g.pins, first, last, mirrored, die) {
+                Some(at) => place_at(&mut slots, g, at, &mut placed, &mut unplaced, &mut done),
+                None => {
+                    fits = false;
+                    break;
+                }
+            }
+        }
+        if !fits {
+            slots = saved.0;
+            placed.truncate(saved.1);
+            unplaced.truncate(saved.2);
+            done = saved.3;
+        }
+        fits
+    };
+    // `placeFallbackGroupsFirstFit`
+    for &gi in fallback.iter().filter(|_| !near) {
+        let g = &groups[gi];
         // A constrained oversized group is confined to its own region; upstream tries the middle
         // of that region first so the group sits centred rather than jammed against one end.
         let window = constraints
@@ -302,18 +352,7 @@ pub fn place_with_constraints(
             None => crate::groups::first_run(&slots, 0, slots.len() - 1, g.pins.len()),
         };
         match start {
-            Some(at) => {
-                let p = crate::groups::place_fallback(&mut slots, g, at);
-                // Reflections are claimed here, beside the placement that caused them — the one
-                // place they can be claimed exactly once.
-                let (mirrors, failed) = crate::sections::expand_mirrors(&mut slots, pins, &p, die);
-                for x in p.iter().chain(mirrors.iter()) {
-                    done[x.pin] = true;
-                }
-                placed.extend(p);
-                placed.extend(mirrors);
-                unplaced.extend(failed);
-            }
+            Some(at) => place_at(&mut slots, g, at, &mut placed, &mut unplaced, &mut done),
             None => unplaced.extend(g.pins.iter().copied()),
         }
     }
@@ -409,6 +448,45 @@ mod tests {
 
     const DIE: (i32, i32, i32, i32) = (0, 0, 1000, 1000);
 
+    fn standing(name: &str, x: i32) -> Pin {
+        Pin { name: name.into(), sinks: vec![], mirror: None, initial: Some((x, 0)) }
+    }
+
+    fn bottom(n: i32) -> Vec<Slot> {
+        (0..n).map(|i| Slot { x: 50 + i * 100, y: 0, layer: "met1".into(), edge: Edge::Bottom, blocked: false }).collect()
+    }
+
+    // Rule (placeFallbackPins): a displacement-minimising run places an oversized group where it
+    // moves least (placeFallbackGroupsNearInitial), not in the first run that fits.
+    #[test]
+    fn a_displacement_minimising_fallback_group_stays_near_where_it_stands() {
+        let slots = bottom(10);
+        let pins: Vec<Pin> = (0..4).map(|i| standing(&format!("a{i}"), 350 + i * 100)).collect();
+        let groups = vec![Group { pins: vec![0, 1, 2, 3], ordered: false }];
+        let all: std::collections::BTreeSet<usize> = (0..4).collect();
+        let (placed, unplaced) = place_with_constraints(&slots, &pins, &groups, &[], &all, 3, DIE);
+        assert!(unplaced.is_empty());
+        assert_eq!(placed.iter().map(|p| p.slot).collect::<Vec<_>>(), [3, 4, 5, 6]);
+        let plain: Vec<Pin> = pins.iter().map(|p| Pin { initial: None, ..p.clone() }).collect();
+        let (placed, _) = place_with_constraints(&slots, &plain, &groups, &[], &all, 3, DIE);
+        assert_eq!(placed.iter().map(|p| p.slot).collect::<Vec<_>>(), [0, 1, 2, 3], "first fit");
+    }
+
+    // Rule (placeFallbackGroupsNearInitial): when a later group then has no room, every group is
+    // undone and placed by first fit instead.
+    #[test]
+    fn a_fallback_group_with_no_room_undoes_the_near_placement() {
+        let slots = bottom(10);
+        let mut pins: Vec<Pin> = (0..4).map(|i| standing(&format!("a{i}"), 350 + i * 100)).collect();
+        pins.extend((0..5).map(|i| standing(&format!("b{i}"), 50 + i * 100)));
+        let groups = vec![Group { pins: vec![0, 1, 2, 3], ordered: false }, Group { pins: vec![4, 5, 6, 7, 8], ordered: false }];
+        let all: std::collections::BTreeSet<usize> = (0..9).collect();
+        // near, a takes 3..=6 and leaves runs of 3 for b's 5: undone; first fit puts a on 0..=3, b on 4..=8
+        let (placed, unplaced) = place_with_constraints(&slots, &pins, &groups, &[], &all, 3, DIE);
+        assert!(unplaced.is_empty(), "{unplaced:?}");
+        assert_eq!(placed.iter().map(|p| (p.pin, p.slot)).collect::<Vec<_>>(), (0..9).map(|i| (i, i)).collect::<Vec<_>>());
+    }
+
     fn slot(x: i32, y: i32, edge: Edge) -> Slot {
         Slot { x, y, layer: "met1".into(), edge, blocked: false }
     }
@@ -428,7 +506,7 @@ mod tests {
     }
 
     fn pin(name: &str, sinks: &[(i32, i32)]) -> Pin {
-        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None }
+        Pin { name: name.into(), sinks: sinks.to_vec(), mirror: None, initial: None }
     }
 
     #[test]
