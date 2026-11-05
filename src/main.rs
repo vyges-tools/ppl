@@ -103,7 +103,9 @@ OPTIONS:
   --max-iterations N     annealing temperature steps (default 2000)
   --perturb-per-iter N   perturbations per step (default: scaled to the pin count)
   --alpha A              annealing cooling rate (default 0.985)
-  --random-seed N        annealing seed (default 42)
+  --random, --random-seed N
+                         obsolete, as in the reference: warn PPL-0113 and place
+                         nothing (the database is written unchanged)
   --evaluate FILE        also score a reference placement under the same cost model.
                          FILE is JSON mapping each pin name to an [x, y] pair in DBU.
                          Reports reference_hpwl, so a placement that merely DIFFERS
@@ -191,6 +193,7 @@ const DESCRIBE: &str = r#"{
       { "arg": "hor_extension", "flag": "--hor-extension" },
       { "arg": "ver_extension", "flag": "--ver-extension" },
       { "arg": "annealing", "flag": "--annealing" },
+      { "arg": "random", "flag": "--random" },
       { "arg": "random_seed", "flag": "--random-seed" },
       { "arg": "out", "flag": "-o" },
       { "arg": "out_odb", "flag": "--out-odb" }
@@ -212,7 +215,8 @@ const DESCRIBE: &str = r#"{
       "hor_extension": { "type": "number", "description": "how far pins on the left/right edges reach past the die, in microns" },
       "ver_extension": { "type": "number", "description": "the same for pins on the bottom/top edges" },
       "annealing": { "type": "boolean", "description": "place by simulated annealing instead of optimal matching" },
-      "random_seed": { "type": "integer", "description": "annealing seed (default 42)" },
+      "random": { "type": "boolean", "description": "obsolete: warns PPL-0113 and places nothing, as the reference does" },
+      "random_seed": { "type": "integer", "description": "obsolete: warns PPL-0113 and places nothing, as the reference does" },
       "out": { "type": "string", "description": "write the report to FILE instead of stdout" },
       "out_odb": { "type": "string", "description": "write the database with the placed pins to FILE" }
     }
@@ -234,6 +238,7 @@ struct Opts {
     keys: Vec<(String, String)>,
     in_tracks: bool,
     annealing: bool,
+    random: bool,
 }
 
 impl Opts {
@@ -252,6 +257,7 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--json" => {}
             "--min-distance-in-tracks" => o.in_tracks = true,
             "--annealing" => o.annealing = true,
+            "--random" => o.random = true,
             a if a.starts_with("--") || a == "-o" => {
                 i += 1;
                 let v = args.get(i).cloned().ok_or_else(|| format!("{a} needs a value"))?;
@@ -416,6 +422,37 @@ fn slots(args: &[String]) -> ExitCode {
     }
 }
 
+/// Either obsolete switch, given at all (`info exists flags(-random)` or `keys(-random_seed)`).
+fn is_obsolete_random(opts: &Opts) -> bool {
+    opts.random || opts.get("random-seed").is_some()
+}
+
+/// Rule (`place_pins`' Tcl): `-random` or `-random_seed` warns PPL-0113 and the whole command is
+/// skipped — no pin moves and nothing else is reported. The report says so, and `--out-odb` is the
+/// database exactly as read.
+fn obsolete_random(opts: &Opts) -> ExitCode {
+    let mut log = RunLog::new();
+    log.warn(113, "-random and -random_seed are obsolete. Skipping random pin placement.".into());
+    if let Err(e) = write_report(opts, r#"{"skipped": "PPL-0113", "placements": [], "unplaced": []}"#) {
+        diag!("vyges-ppl: {e}");
+        return ExitCode::from(2);
+    }
+    if let Some(out) = opts.get("out-odb") {
+        let db = match Db::open(&opts.odb) {
+            Ok(db) => db,
+            Err(e) => {
+                diag!("vyges-ppl: cannot read {}: {e}", opts.odb);
+                return ExitCode::from(2);
+            }
+        };
+        if let Err(e) = db.write(out) {
+            diag!("vyges-ppl: cannot write {out}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn place_pins(args: &[String]) -> ExitCode {
     let opts = match parse_opts(args) {
         Ok(o) => o,
@@ -424,6 +461,9 @@ fn place_pins(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if is_obsolete_random(&opts) {
+        return obsolete_random(&opts);
+    }
     let mut p = match prepare(&opts) {
         Ok(p) => p,
         Err(e) => {
@@ -616,7 +656,9 @@ fn anneal_config(opts: &Opts) -> Result<annealing::Anneal, String> {
         max_iterations: int("max-iterations", d.max_iterations)?,
         perturb_per_iter: int("perturb-per-iter", d.perturb_per_iter)?,
         alpha: num("alpha", d.alpha)?,
-        seed: int("random-seed", d.seed as i32)? as u32,
+        // The reference's annealer seeds itself with a constant (`seed_`); place_pins has no
+        // switch for it — `-random_seed` is the obsolete random placement, see `place_pins`.
+        seed: d.seed,
     })
 }
 
@@ -938,6 +980,16 @@ pub fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn either_obsolete_random_switch_skips_the_placement() {
+        // Rule (place_pins' Tcl): -random OR -random_seed (any value) warns PPL-0113 and skips
+        // the whole placement; neither given, the run places.
+        let o = |a: &[&str]| parse_opts(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+        assert!(is_obsolete_random(&o(&["d.odb", "--random"])));
+        assert!(is_obsolete_random(&o(&["d.odb", "--random-seed", "20"])));
+        assert!(!is_obsolete_random(&o(&["d.odb", "--annealing"])));
+    }
 
     #[test]
     fn a_setting_the_run_did_not_give_comes_from_set_place_config() {
