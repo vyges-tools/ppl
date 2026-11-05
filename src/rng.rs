@@ -103,7 +103,11 @@ impl Mt19937 {
     /// the reference's arithmetic amounts to — narrowing first would lose bits the comparison
     /// depends on.
     pub fn uniform_real(&mut self) -> f32 {
-        (self.next_u32() as f64 / (Self::BRANGE as f64 + 1.0)) as f32
+        loop {
+            if let Some(v) = real_from(self.next_u32()) {
+                return v;
+            }
+        }
     }
 
     /// Shuffle in place, matching the reference's own shuffle helper.
@@ -136,6 +140,17 @@ pub(crate) fn bucket_size(range: u64) -> u64 {
         bucket += 1;
     }
     bucket
+}
+
+/// One raw output as [`Mt19937::uniform_real`] reads it, or `None` when boost redraws it.
+///
+/// Rule (boost `generate_uniform_real`, integral engine): `numerator / divisor` computed in the
+/// RESULT type (`f32` here), the divisor being the span plus one, `2^32`; a result that is not
+/// below the upper bound is discarded and the engine drawn again. Rounding the output to `f32`
+/// sends anything within 128 of `2^32` to exactly `1.0`, so those outputs cost an extra draw.
+pub(crate) fn real_from(n: u32) -> Option<f32> {
+    let v = n as f32 / (Mt19937::BRANGE as f32 + 1.0);
+    (v < 1.0).then_some(v)
 }
 
 #[cfg(test)]
@@ -187,6 +202,21 @@ mod tests {
         let mut g = Mt19937::new(42);
         let got: Vec<i64> = (0..28342).map(|_| g.uniform_int(0, 1023)).collect();
         assert_eq!((got[17332], got[28194], got[28341]), (723, 997, 834));
+    }
+
+    #[test]
+    fn a_uniform_real_that_rounds_to_one_is_drawn_again() {
+        // Rule (boost generate_uniform_real): the quotient is formed in f32 and a result not
+        // below 1.0 is redrawn. From seed 198, boost's draw 93738 consumes two outputs and
+        // returns 0x1.42e3d4p-1; a single-draw reading returns 1.0 there and is one behind after.
+        assert_eq!(real_from(u32::MAX), None);
+        assert_eq!(real_from(u32::MAX - 127), None);
+        assert!(real_from(u32::MAX - 128).is_some_and(|v| v < 1.0));
+        let mut g = Mt19937::new(198);
+        for _ in 0..93738 {
+            g.uniform_real();
+        }
+        assert_eq!(g.uniform_real(), f32::from_bits(0x3f21_71ea));
     }
 
     #[test]
