@@ -80,8 +80,8 @@ USAGE:
   vyges physical ppl --help
 
 OPTIONS:
-  --hor-layers L,…       layers carrying pins on the LEFT and RIGHT edges (required)
-  --ver-layers L,…       layers carrying pins on the BOTTOM and TOP edges (required)
+  --hor-layers L,…       layers carrying pins on the LEFT and RIGHT edges (else set_place_config's)
+  --ver-layers L,…       layers carrying pins on the BOTTOM and TOP edges (else set_place_config's)
   --min-distance D       minimum spacing between pins, in MICRONS
                          (omitted: candidates every 2 tracks — not 'no spacing')
   --min-distance-in-tracks   read --min-distance as a count of candidate slots instead
@@ -306,19 +306,51 @@ fn edge_name(e: Edge) -> &'static str {
 
 use vyges_ppl::session::Prepared;
 
-fn prepare(opts: &Opts) -> Result<Prepared, String> {
-    let hor = layer_list(opts, "hor-layers");
-    let ver = layer_list(opts, "ver-layers");
-    if hor.is_empty() && ver.is_empty() {
-        return Err("--hor-layers and/or --ver-layers is required".into());
+/// The run's pin layers: each direction from its switch, else from `set_place_config`'s stored
+/// list (`applySettings`: `hor_layers_`/`ver_layers_` filled only when empty).
+fn run_layers(opts: &Opts, db: &Db) -> (Vec<String>, Vec<String>) {
+    let (hor, ver) = (layer_list(opts, "hor-layers"), layer_list(opts, "ver-layers"));
+    if !hor.is_empty() && !ver.is_empty() {
+        return (hor, ver);
     }
+    let stored = vyges_ppl::session::place_config_args(db);
+    (if hor.is_empty() { stored.hor } else { hor }, if ver.is_empty() { stored.ver } else { ver })
+}
 
+/// Rule (`IOPlacer::applySettings`): a corner avoidance left unset (negative) takes the stored
+/// one, and a minimum distance left at 0 takes the stored distance AND its in-tracks flag; a
+/// value the run gave stands. (The layers fall back likewise, each direction on its own.)
+///
+/// ⏭ Pending upstream #12094 (per-layer IO pin minimum distance, ppl and gpl) would change what
+/// the stored minimum distance is; if it lands, this function and its test are the repin edit.
+fn apply_settings(mut given: Params, stored: &Params) -> Params {
+    if given.corner_avoidance < 0 {
+        given.corner_avoidance = stored.corner_avoidance;
+    }
+    if given.min_distance == 0 {
+        given.min_distance = stored.min_distance;
+        given.min_distance_in_tracks = stored.min_distance_in_tracks;
+    }
+    given
+}
+
+fn prepare(opts: &Opts) -> Result<Prepared, String> {
     let db = Db::open(&opts.odb).map_err(|e| format!("cannot read {}: {e}", opts.odb))?;
     let dbu = db.dbu_per_micron();
     if dbu <= 0 {
         return Err("no DBU scale".into());
     }
-    let params = Params {
+    // `applySettings`: what `set_place_config` stored on the block stands in for each switch
+    // this run did not give — see [`apply_settings`].
+    let stored = vyges_ppl::session::place_config_args(&db);
+    let (hor, ver) = run_layers(opts, &db);
+    if hor.is_empty() {
+        return Err("[ERROR PPL-0017] -hor_layers or set_place_config -io_pin_hor_layers is required.".into());
+    }
+    if ver.is_empty() {
+        return Err("[ERROR PPL-0018] -ver_layers or set_place_config -io_pin_ver_layers is required.".into());
+    }
+    let given = Params {
         // In tracks it is a raw count; otherwise a length in microns. Not converting the
         // in-tracks form is the whole point of the flag.
         min_distance: if opts.in_tracks {
@@ -334,6 +366,7 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
         thickness_multiplier_h: multiplier(opts, "hor-multiplier")?,
         thickness_multiplier_v: multiplier(opts, "ver-multiplier")?,
     };
+    let params = apply_settings(given, &stored.params);
 
     // `set_pin_length -hor_length/-ver_length` (microns, to database units as `microns_to_dbu`
     // does): it replaces the pin's depth, so it also deepens every keep-out the pin is measured
@@ -412,7 +445,8 @@ fn place_pins(args: &[String]) -> ExitCode {
         }
     }
     log.report(format!("Found {macros} macro blocks."));
-    if opts.get("min-distance").is_none() {
+    // Only when set_place_config stored no distance either (`get_default_min_distance` is 0).
+    if opts.get("min-distance").is_none() && vyges_ppl::session::place_config_args(&p.db).params.min_distance == 0 {
         log.report("Using 2 tracks default min distance between IO pins.".into());
     }
     let per_section = match opts.get("slots-per-section") {
@@ -549,7 +583,7 @@ fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[matching::
         hor_multiplier: multiplier(opts, "hor-multiplier").map_err(|e| (2, e))?,
         ver_multiplier: multiplier(opts, "ver-multiplier").map_err(|e| (2, e))?,
     };
-    let (hor, ver) = (layer_list(opts, "hor-layers"), layer_list(opts, "ver-layers"));
+    let (hor, ver) = run_layers(opts, &p.db);
     let surface = matching::Surface { boundary: p.boundary, slots: &p.slots, on_segment: p.on_segment.as_deref(), hor: &hor, ver: &ver };
     matching::commit(&mut p.db, &surface, &shape, pins, placed, unplaced).map_err(|f| (if matches!(f, matching::Fail::Error(39, _)) { 1 } else { 2 }, f.line()))?;
     p.db.write(out).map_err(|e| (2, format!("cannot write {out}: {e}")))
@@ -904,6 +938,18 @@ pub fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_setting_the_run_did_not_give_comes_from_set_place_config() {
+        // Rule (IOPlacer::applySettings): corner avoidance < 0 takes the stored value; a minimum
+        // distance of 0 takes the stored distance AND its in-tracks flag; given values stand.
+        let stored = Params { corner_avoidance: 700, min_distance: 3, min_distance_in_tracks: true, ..Params::default() };
+        let got = apply_settings(Params::default(), &stored);
+        assert_eq!((got.corner_avoidance, got.min_distance, got.min_distance_in_tracks), (700, 3, true));
+        let given = Params { corner_avoidance: 0, min_distance: 140, ..Params::default() };
+        let got = apply_settings(given, &stored);
+        assert_eq!((got.corner_avoidance, got.min_distance, got.min_distance_in_tracks), (0, 140, false));
+    }
 
     /// ⛔ **DEF escapes a bracket as `\[`, and `\[` is not a legal JSON escape.**
     ///
