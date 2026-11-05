@@ -48,6 +48,7 @@ pub mod commit;
 pub mod constraints;
 pub mod groups;
 pub mod hungarian;
+pub mod matching;
 pub mod sections;
 pub mod session;
 pub mod polygon;

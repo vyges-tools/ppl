@@ -61,9 +61,7 @@ impl RunLog {
     }
 }
 
-use vyges_ppl::{collect_constraints,
-    annealing, place_with_constraints, polygon, run_round, sort_constraints, toplayer, Boundary,
-    Edge, Group, Params, Pin, Placement, Slot, SLOTS_PER_SECTION};
+use vyges_ppl::{annealing, matching, Boundary, Edge, Group, Params, Pin, Slot, SLOTS_PER_SECTION};
 
 // ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
 // registry is what actually decides it (`group: "physical"`). It read `vyges loom ppl`
@@ -345,52 +343,6 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
     vyges_ppl::session::prepare_slots(db, &vyges_ppl::session::SlotArgs { hor, ver, params, hor_length, ver_length })
 }
 
-/// The IO pins to place, and where each one's net actually pulls it.
-///
-/// Follows the database's own port order, which is what makes the assignment reproducible: pins
-/// are considered in this order when competing for a section, so a different order is a different
-/// placement.
-///
-/// Two exclusions, both of which change the answer if missed. A port whose placement is already
-/// **fixed** is not ours to move. A port with **no net** has nothing to be near.
-fn read_pins(db: &Db, center: (i32, i32)) -> Vec<Pin> {
-    let mut out = Vec::new();
-    for name in db.bterm_names() {
-        if is_fixed(&db.bterm_get_first_pin_placement_status(&name)) {
-            continue;
-        }
-        let net = db.bterm_net(&name);
-        if net.is_empty() {
-            continue;
-        }
-        let mut sinks = Vec::new();
-        for iterm in db.net_iterms(&net) {
-            // "instance/terminal", and an instance name may itself contain a separator, so the
-            // split has to come from the right.
-            let Some((inst, mterm)) = iterm.rsplit_once('/') else { continue };
-            // An unplaced instance has no position to be near, so it is treated as sitting at the
-            // middle of the die — which leaves the pin free to go wherever else its net wants.
-            if is_unplaced(&db.inst_get_placement_status(inst)) {
-                sinks.push(center);
-            } else if let Some(p) = db.iterm_avg_xy(inst, mterm) {
-                sinks.push(p);
-            }
-        }
-        out.push(Pin { name, sinks, mirror: None, initial: None });
-    }
-    out
-}
-
-/// odb reports placement status as a name. `isFixed` is true for exactly these three.
-fn is_fixed(status: &str) -> bool {
-    matches!(status, "LOCKED" | "FIRM" | "COVER")
-}
-
-/// ...and these two mean "has no meaningful position yet".
-fn is_unplaced(status: &str) -> bool {
-    matches!(status, "NONE" | "UNPLACED")
-}
-
 fn write_report(opts: &Opts, report: &str) -> Result<(), String> {
     match opts.get("o") {
         Some(path) => std::fs::write(path, format!("{report}\n"))
@@ -474,93 +426,21 @@ fn place_pins(args: &[String]) -> ExitCode {
         },
     };
 
-    let center = ((p.boundary.x0 + p.boundary.x1) / 2, (p.boundary.y0 + p.boundary.y1) / 2);
-    let mut pins = read_pins(&p.db, center);
-
-    // Mirrored pairs. Only ONE of a pair competes for a slot — the one the database records as
-    // having a mirrored partner; the other is placed at the reflected position of whatever the
-    // first gets. Giving both a say would let the two halves disagree about where the pair goes.
-    for i in 0..pins.len() {
-        if !p.db.bterm_has_mirrored_b_term(&pins[i].name) {
-            continue;
-        }
-        let partner = p.db.bterm_get_mirrored_b_term(&pins[i].name);
-        pins[i].mirror = pins.iter().position(|q| q.name == partner);
-    }
-    let pins = pins;
-
-    // Constraints are read back from the DATABASE, not from this command line: the design writes
-    // them onto its ports, so a placer told them separately could disagree with what it reads.
     let die = (p.boundary.x0, p.boundary.y0, p.boundary.x1, p.boundary.y1);
-    let regions: Vec<Option<(i32, i32, i32, i32)>> = pins
-        .iter()
-        .map(|pin| p.db.bterm_constraint_region(&pin.name).ok().flatten())
-        .collect();
-    let mirrored: Vec<bool> = pins.iter().map(|pin| p.db.bterm_is_mirrored(&pin.name)).collect();
-    // Pin groups, likewise stored on the block rather than passed in. Named ports are resolved to
-    // pin indices here; a group naming a port that is fixed or netless simply loses that member.
-    let index_of = |name: &str| pins.iter().position(|p| p.name == name);
-    let groups: Vec<Group> = p
-        .db
-        .bterm_groups()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(names, ordered)| Group {
-            pins: names.iter().filter_map(|n| index_of(n)).collect(),
-            ordered,
-        })
-        .filter(|g| !g.pins.is_empty())
-        .collect();
-
-    let mut constraints = collect_constraints(&pins, die, &|i| regions[i], &|i| mirrored[i]);
-    // Where two regions share slots, whoever is served first takes them, so the order is part of
-    // the answer rather than a detail of iteration.
-    sort_constraints(&mut constraints, &p.slots, per_section);
+    let net = matching::init_netlist(&p.db, die, &p.slots, per_section, false);
 
     // ── Top layer ────────────────────────────────────────────────────────────────────────────
     // Pins sent to the top layer are placed on their own lattice, not on the boundary, so they are
     // taken out of the edge problem entirely rather than competing in it.
-    let (top_slots, top_pins) = read_top_layer(&p.db, die, &pins);
+    let (top_slots, top_pins) = matching::read_top_layer(&p.db, die, &net.pins);
     // `printConfig`: what the run was given, before any pin is assigned.
-    let config = vyges_ppl::report::Config {
-        available_slots: p.slots.iter().filter(|s| !s.blocked).count(),
-        top_layer_slots: top_slots.len(),
-        ios: pins.len(),
-        ios_without_sink: pins.iter().filter(|pin| p.db.net_iterms(&p.db.bterm_net(&pin.name)).is_empty()).count(),
-        groups: groups.len(),
-        slots_per_section: (!opts.annealing).then_some(per_section),
-        minimize_displacement: false,
-    };
+    let config = matching::config(&p.db, &p.slots, &top_slots, &net, (!opts.annealing).then_some(per_section), false);
     for line in vyges_ppl::report::config(&config) {
         log.info(line);
     }
     let top_set: std::collections::BTreeSet<usize> = top_pins.iter().map(|&(i, _)| i).collect();
-    let (top_placed, mut unplaced) = place_top_layer(&top_slots, &pins, &top_pins, per_section);
-
-    // ── The boundary ─────────────────────────────────────────────────────────────────────────
-    let boundary_pins: Vec<Pin> = pins
-        .iter()
-        .enumerate()
-        .map(|(i, pin)| {
-            // A top-layer pin is removed from the edge problem by giving it no name to match and
-            // no constraint; it is simpler and safer to filter it where the two lists are joined.
-            let _ = i;
-            pin.clone()
-        })
-        .collect();
-    let edge_constraints: Vec<vyges_ppl::Constraint> = constraints
-        .iter()
-        .map(|c| vyges_ppl::Constraint {
-            interval: c.interval,
-            pins: c.pins.iter().copied().filter(|i| !top_set.contains(i)).collect(),
-        })
-        .filter(|c| !c.pins.is_empty())
-        .collect();
-    let edge_groups: Vec<Group> = groups
-        .iter()
-        .filter(|g| !g.pins.iter().any(|i| top_set.contains(i)))
-        .cloned()
-        .collect();
+    let (top_placed, mut unplaced) = matching::place_top_layer(&top_slots, &net.pins, &top_pins, per_section);
+    let (pins, groups, constraints) = (&net.pins, &net.groups, &net.constraints);
 
     // ── Annealing ────────────────────────────────────────────────────────────────────────────
     // A wholly different optimiser, so it REPLACES the boundary placement rather than adjusting
@@ -576,7 +456,7 @@ fn place_pins(args: &[String]) -> ExitCode {
             }
         };
         let outcome = if constraints.is_empty() && groups.is_empty() {
-            annealing::run(&p.slots, &pins, die, &cfg)
+            annealing::run(&p.slots, pins, die, &cfg)
         } else {
             Err(annealing::Unsupported::NeedsExtraMoves)
         };
@@ -594,80 +474,17 @@ fn place_pins(args: &[String]) -> ExitCode {
         None
     };
 
-    let (edge_placed, edge_unplaced) = match (&annealed, &p.on_segment) {
-        (Some(v), _) => (v.clone(), Vec::new()),
-        // A polygon die's sections come from its segments. Edge-named region constraints have no
-        // meaning against an arbitrary outline, so they are reported and not applied — quietly
-        // reinterpreting them against the bounding box would satisfy a constraint the design did
-        // not ask for.
-        (None, Some(on_segment)) => {
-            if !edge_constraints.is_empty() {
-                vyges_events::emit(
-                    &vyges_events::Event::new(
-                        "vyges-ppl",
-                        vyges_events::Severity::Warn,
-                        format!(
-                            "{} edge region constraint(s) ignored: this die is a polygon and has \
-                             no named edges",
-                            edge_constraints.len()
-                        ),
-                    )
-                    .with_code("PPL-POLYGON-NO-CONSTRAINTS"),
-                );
-            }
-            let mut slots: Vec<Slot> = p.slots.clone();
-            let mut sections = polygon::create_sections(&slots, on_segment, per_section);
-            let which_pins: Vec<usize> =
-                (0..pins.len()).filter(|i| !top_set.contains(i)).collect();
-            let which_groups: Vec<usize> = (0..edge_groups.len()).collect();
-            run_round(
-                &mut slots,
-                &mut sections,
-                &boundary_pins,
-                &edge_groups,
-                &which_groups,
-                &which_pins,
-                per_section,
-                die,
-            )
-        }
-        (None, None) => {
-            // Only the pins this boundary owns. A top-layer pin left in the pool would take a
-            // boundary slot and then be discarded, quietly pushing a real boundary pin onto a
-            // worse one.
-            let eligible: std::collections::BTreeSet<usize> =
-                (0..pins.len()).filter(|i| !top_set.contains(i)).collect();
-            place_with_constraints(
-                &p.slots,
-                &boundary_pins,
-                &edge_groups,
-                &edge_constraints,
-                &eligible,
-                per_section,
-                die,
-            )
-        }
+    let (edge_placed, edge_unplaced) = match &annealed {
+        Some(v) => (v.clone(), Vec::new()),
+        None => matching::place_boundary(&p.slots, p.on_segment.as_deref(), &net, &top_set, per_section, die),
     };
     unplaced.extend(edge_unplaced.into_iter().filter(|i| !top_set.contains(i)));
-
-    // Resolve both lists to coordinates. Slot indices mean different things in each, so they are
-    // never mixed — only the resolved positions are.
-    let mut placed: Vec<Placed> = Vec::new();
-    placed.extend(top_placed.iter().map(|x| Placed::of(x, &top_slots, p.slots.len())));
-    placed.extend(
-        edge_placed
-            .iter()
-            .filter(|x| !top_set.contains(&x.pin))
-            .map(|x| Placed::of(x, &p.slots, 0)),
-    );
-    placed.sort_by_key(|x| x.pin);
-    unplaced.sort_unstable();
-    unplaced.dedup();
+    let (placed, unplaced) = matching::resolve((&top_placed, &top_slots), &edge_placed, &p.slots, &top_set, unplaced);
     if annealed.is_none() {
         log.info(vyges_ppl::report::sections_assigned(pins.len() - unplaced.len(), pins.len()));
     }
     if unplaced.is_empty() {
-        log.info(vyges_ppl::report::io_hpwl(&pins, placed.iter().map(|x| (x.pin, (x.x, x.y))), p.dbu));
+        log.info(vyges_ppl::report::io_hpwl(pins, placed.iter().map(|x| (x.pin, (x.x, x.y))), p.dbu));
     }
 
     emit_slot_events(&p.slots, &p.trackless);
@@ -682,12 +499,12 @@ fn place_pins(args: &[String]) -> ExitCode {
             .with_code("PPL-EXCLUDED"),
         );
     }
-    emit_constraint_events(&constraints, &groups, &pins);
-    emit_placement_events(&pins, &placed, &unplaced);
+    emit_constraint_events(constraints, groups, pins);
+    emit_placement_events(pins, &placed, &unplaced);
 
     let reference = match opts.get("evaluate") {
         None => None,
-        Some(path) => match score_reference(path, &pins) {
+        Some(path) => match score_reference(path, pins) {
             Ok(v) => Some(v),
             Err(e) => {
                 diag!("vyges-ppl: {e}");
@@ -698,13 +515,13 @@ fn place_pins(args: &[String]) -> ExitCode {
 
     let outline = p.db.die_area_polygon().unwrap_or_default();
     let report =
-        placement_json(&pins, &groups, &placed, &unplaced, p.boundary, &outline, p.dbu, reference);
+        placement_json(pins, groups, &placed, &unplaced, p.boundary, &outline, p.dbu, reference);
     if let Err(e) = write_report(&opts, &report) {
         diag!("vyges-ppl: {e}");
         return ExitCode::from(2);
     }
     if let Some(out) = opts.get("out-odb") {
-        if let Err((code, e)) = commit_pins(&opts, &mut p, &pins, &placed, &unplaced, out) {
+        if let Err((code, e)) = commit_pins(&opts, &mut p, pins, &placed, &unplaced, out) {
             diag!("vyges-ppl: {e}");
             return ExitCode::from(code);
         }
@@ -716,70 +533,21 @@ fn place_pins(args: &[String]) -> ExitCode {
     }
 }
 
-/// `IOPlacer::commitIOPlacementToDB`: every placed pin's port pins replaced by one pin on its
-/// layer — the rectangle `updatePinArea` gives it — PLACED, and the database written to `out`.
-///
-/// A pin's orientation comes from its position on a rectangle (`updateOrientation`), from probes
-/// either side of its segment on a polygon (`updateOrientationPolygon`). Refused: a placement that
-/// left a pin unplaced (upstream stops with PPL-0039 before committing anything).
-/// Errors as upstream's: no manufacturing grid (PPL-0020), a pin smaller than its layer's minimum
-/// area (PPL-0079).
-fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[Placed], unplaced: &[usize], out: &str) -> Result<(), (u8, String)> {
-    use vyges_ppl::commit::{area, orientation, pin_rect, polygon_orientation, top_layer_rect, Orientation};
-    let ring = p.db.die_area_polygon().unwrap_or_default();
-    let segments = vyges_ppl::polygon::segments(&ring);
-    if !unplaced.is_empty() {
-        // The reference's error, word for word: it stops here too, nothing written.
-        return Err((1, format!("PPL-0039 Assigned {} pins out of {} IO pins.", placed.len(), placed.len() + unplaced.len())));
-    }
-    let mfg = p.db.tech_get_manufacturing_grid();
-    let dbu_um = f64::from(p.db.tech_get_db_units_per_micron());
-    if mfg == 0 {
-        return Err((2, "PPL-0020 Manufacturing grid is not defined.".into()));
-    }
+/// `commitIOPlacementToDB` ([`matching::commit`]) with this command line's pin sizing, and the
+/// database written to `out`. Exit 1 for an unplaced pin (PPL-0039), 2 for anything else.
+fn commit_pins(opts: &Opts, p: &mut Prepared, pins: &[Pin], placed: &[matching::Placed], unplaced: &[usize], out: &str) -> Result<(), (u8, String)> {
     let length = |key: &str| -> Result<Option<i32>, (u8, String)> { Ok(Some(microns(opts, key, p.dbu, -1).map_err(|e| (2, e))?).filter(|v| *v != -1)) };
-    let (hor_length, ver_length) = (length("hor-length")?, length("ver-length")?);
-    let (hor_ext, ver_ext) = (length("hor-extension")?.unwrap_or(0), length("ver-extension")?.unwrap_or(0));
-    let (mul_h, mul_v) = (multiplier(opts, "hor-multiplier").map_err(|e| (2, e))?, multiplier(opts, "ver-multiplier").map_err(|e| (2, e))?);
+    let shape = matching::PinShape {
+        hor_length: length("hor-length")?,
+        ver_length: length("ver-length")?,
+        hor_extension: length("hor-extension")?.unwrap_or(0),
+        ver_extension: length("ver-extension")?.unwrap_or(0),
+        hor_multiplier: multiplier(opts, "hor-multiplier").map_err(|e| (2, e))?,
+        ver_multiplier: multiplier(opts, "ver-multiplier").map_err(|e| (2, e))?,
+    };
     let (hor, ver) = (layer_list(opts, "hor-layers"), layer_list(opts, "ver-layers"));
-    let directions: std::collections::HashMap<String, String> = p.db.layers_with_direction().unwrap_or_default().into_iter().collect();
-    let top = p.db.bterm_top_layer_grid().ok().flatten();
-    let die = (p.boundary.x0, p.boundary.y0, p.boundary.x1, p.boundary.y1);
-    let mut rects = Vec::with_capacity(placed.len());
-    for x in placed {
-        let name = &pins[x.pin].name;
-        let r = if x.slot >= p.slots.len() {
-            let g = top.as_ref().ok_or((2, format!("{name}: a top-layer pin with no top-layer grid")))?;
-            top_layer_rect((x.x, x.y), g.pin_width, g.pin_height)
-        } else {
-            if !hor.contains(&x.layer) && !ver.contains(&x.layer) {
-                return Err((2, format!("PPL-0077 Layer {} of Pin {name} not found.", x.layer)));
-            }
-            let o = match &p.on_segment {
-                // The slot's segment says whether to probe across x or across y.
-                Some(on) => polygon_orientation((x.x, x.y), segments[on[x.slot]].a.0 == segments[on[x.slot]].b.0, &ring)
-                    .ok_or((2, format!("PPL-9999 Could not determine orientation for pin {name} at ({:.2}um, {:.2}um)", f64::from(x.x) / dbu_um, f64::from(x.y) / dbu_um)))?,
-                None => orientation((x.x, x.y), die).ok_or((2, format!("{name}: placed off the die boundary")))?,
-            };
-            // `computePinSize` reads the LAYER's direction, not the edge's.
-            let vertical = directions.get(&x.layer).is_some_and(|d| d == "VERTICAL");
-            let (mul, user) = if vertical { (mul_v, ver_length) } else { (mul_h, hor_length) };
-            let min_area = p.db.layer_get_area(&x.layer).unwrap_or(0);
-            let (half_width, height) = vyges_ppl::blocked::pin_size(p.db.layer_get_width(&x.layer) as i32, min_area, mul, user, mfg);
-            let ext = if matches!(o, Orientation::North | Orientation::South) { ver_ext } else { hor_ext };
-            let r = pin_rect((x.x, x.y), o, half_width, height, ext);
-            if area(r) < min_area {
-                let um2 = |a: i64| a as f64 / (dbu_um * dbu_um);
-                return Err((2, format!("PPL-0079 Pin {name} area {:2.4}um^2 is lesser than the minimum required area {:2.4}um^2.", um2(area(r)), um2(min_area))));
-            }
-            r
-        };
-        rects.push((name.clone(), x.layer.clone(), r));
-    }
-    for (name, layer, r) in &rects {
-        p.db.bterm_clear_unfixed_bpins(name).map_err(|e| (2, format!("{name}: {e}")))?;
-        p.db.place_bterm(name, layer, r.0, r.1, r.2, r.3).map_err(|e| (2, format!("{name}: {e}")))?;
-    }
+    let surface = matching::Surface { boundary: p.boundary, slots: &p.slots, on_segment: p.on_segment.as_deref(), hor: &hor, ver: &ver };
+    matching::commit(&mut p.db, &surface, &shape, pins, placed, unplaced).map_err(|f| (if matches!(f, matching::Fail::Error(39, _)) { 1 } else { 2 }, f.line()))?;
     p.db.write(out).map_err(|e| (2, format!("cannot write {out}: {e}")))
 }
 
@@ -814,162 +582,6 @@ fn anneal_config(opts: &Opts) -> Result<annealing::Anneal, String> {
     })
 }
 
-/// Read the top-layer grid and build its lattice, if the design declares one.
-///
-/// Obstructions are gathered from the three sources that matter on that layer and no others:
-/// routing blockages, the power grid, and ports already fixed. All are filtered to the grid's own
-/// layer — metal on a different layer is not in the way.
-#[allow(clippy::type_complexity)]
-fn read_top_layer(
-    db: &Db,
-    die: (i32, i32, i32, i32),
-    pins: &[Pin],
-) -> (Vec<Slot>, Vec<(usize, (i32, i32, i32, i32))>) {
-    let Ok(Some(g)) = db.bterm_top_layer_grid() else { return (Vec::new(), Vec::new()) };
-    if !g.region_is_rect || g.pin_width <= 0 {
-        // A non-rectangular grid is not handled by the reference either.
-        return (Vec::new(), Vec::new());
-    }
-    let grid = toplayer::Grid {
-        layer: g.layer.clone(),
-        x_step: g.x_step,
-        y_step: g.y_step,
-        pin_width: g.pin_width,
-        pin_height: g.pin_height,
-        keepout: g.keepout,
-        region: g.region,
-    };
-
-    // `filterObstructedSlotsForTopLayer`, in its order: routing obstructions (system-reserved
-    // ones too — "the only filter for slots outside of polygon dies" — but NOT `+ FILLS` /
-    // `+ SLOTS`, which "still allow routing metal over them"), with their DEF rules; the power
-    // grid (`{rect}`, no rules); then every bpin whose OWN status is fixed, with its rules.
-    let mut shapes: Vec<vyges_opendb::RuledShape> = db
-        .obstruction_shapes_with_rules()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|o| !(o.fill || o.slot))
-        .map(|o| o.shape)
-        .collect();
-    shapes.extend(db.swire_boxes().unwrap_or_default().into_iter().map(|(l, x0, y0, x1, y1)| {
-        vyges_opendb::RuledShape { layer: l, rect: (x0, y0, x1, y1), min_spacing: -1, effective_width: -1 }
-    }));
-    shapes.extend(db.bpin_shapes_with_rules().unwrap_or_default().into_iter().map(|b| b.shape));
-    // Each keeps out by the grid's keepout FLOORED at the spacing it asks (`computeShapeSpacing`,
-    // the pin's smaller dimension as its width and its larger as the run length).
-    // `VYGES_PPL_TOPLAYER_TRACE`: the reference's `VYGPPL topobs` / `topslot` lines
-    // (`instruments/ppl/ppl-toplayer-patch.py`), so the two diff directly.
-    let trace = std::env::var_os("VYGES_PPL_TOPLAYER_TRACE").is_some();
-    let (pin_min, pin_max) = (g.pin_width.min(g.pin_height), g.pin_width.max(g.pin_height));
-    let layer_width = db.layer_get_width(&g.layer) as i32;
-    let obstructions: Vec<toplayer::Obstruction> = shapes
-        .iter()
-        .filter(|s| db.layer_name_by_number(s.layer) == g.layer)
-        .map(|s| {
-            let b = s.rect;
-            let spacing = vyges_ppl::blocked::shape_spacing(b, s.min_spacing, s.effective_width, pin_min, pin_max, layer_width, |w, l| {
-                db.layer_get_spacing_width_length(&g.layer, w, l)
-            });
-            let keepout = grid.keepout.max(spacing);
-            if trace {
-                let k = toplayer::keepout_rect(&grid, b, keepout);
-                eprintln!(
-                    "VYGPPL topobs|{} {} {} {}|{}|{}|{spacing}|{keepout}|{} {} {} {}",
-                    b.0, b.1, b.2, b.3, s.min_spacing, s.effective_width, k.0, k.1, k.2, k.3
-                );
-            }
-            (b, keepout)
-        })
-        .collect();
-
-    let slots = toplayer::slots(&grid, die, &obstructions);
-    if trace {
-        for (i, s) in slots.iter().enumerate() {
-            eprintln!("VYGPPL topslot|{i}|{} {}|{}", s.x, s.y, u8::from(s.blocked));
-        }
-    }
-    let claimed = toplayer::constrained_pins(pins, &|i| {
-        db.bterm_constraint_region(&pins[i].name).ok().flatten()
-    });
-    (slots, claimed)
-}
-
-/// Place the top-layer pins on their lattice: sections per region, then optimal matching.
-#[allow(clippy::type_complexity)]
-fn place_top_layer(
-    slots: &[Slot],
-    pins: &[Pin],
-    claimed: &[(usize, (i32, i32, i32, i32))],
-    per_section: usize,
-) -> (Vec<Placement>, Vec<usize>) {
-    if claimed.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    if slots.is_empty() {
-        // Pins were sent to a top layer the design never defined a grid for.
-        return (Vec::new(), claimed.iter().map(|&(i, _)| i).collect());
-    }
-    let mut slots = slots.to_vec();
-    let mut placed = Vec::new();
-    let mut unplaced = Vec::new();
-    // One round per distinct region, so pins constrained to different boxes do not compete.
-    let mut by_region: std::collections::BTreeMap<(i32, i32, i32, i32), Vec<usize>> =
-        Default::default();
-    for &(i, r) in claimed {
-        by_region.entry(r).or_default().push(i);
-    }
-    for (region, members) in by_region {
-        let mut sections = toplayer::sections_for(&slots, region, per_section);
-        unplaced.extend(vyges_ppl::assign_pins_to_sections(
-            pins,
-            &members,
-            &mut sections,
-            &slots,
-            (0, 0, 0, 0),
-        ));
-        let (p, u) = vyges_ppl::solve_sections(
-            &mut slots,
-            &sections,
-            pins,
-            &[],
-            &[],
-            // A lattice has no opposite edge, so no mirroring can apply here.
-            (0, 0, 0, 0),
-        );
-        placed.extend(p);
-        unplaced.extend(u);
-    }
-    (placed, unplaced)
-}
-
-/// One pin's chosen position, with its slot already resolved.
-///
-/// The two placement surfaces index their own slot lists, so a raw slot number means nothing on
-/// its own. Resolving here — and offsetting the top-layer numbers past the boundary's — keeps them
-/// distinguishable without ever mixing the two index spaces.
-struct Placed {
-    pin: usize,
-    x: i32,
-    y: i32,
-    layer: String,
-    edge: Edge,
-    slot: usize,
-}
-
-impl Placed {
-    fn of(p: &Placement, slots: &[Slot], offset: usize) -> Placed {
-        let s = &slots[p.slot];
-        Placed {
-            pin: p.pin,
-            x: s.x,
-            y: s.y,
-            layer: s.layer.clone(),
-            edge: s.edge,
-            slot: p.slot + offset,
-        }
-    }
-}
-
 /// A JSON string literal for `s`, escaped.
 ///
 /// ⛔ **DEF escapes a bracket in a name as `\\[`, and `\\[` is not a legal JSON escape.** This
@@ -989,7 +601,7 @@ fn json_str(s: &str) -> String {
 fn placement_json(
     pins: &[Pin],
     groups: &[Group],
-    placed: &[Placed],
+    placed: &[matching::Placed],
     unplaced: &[usize],
     boundary: Boundary,
     outline: &[(i32, i32)],
@@ -1225,7 +837,7 @@ fn score_reference(path: &str, pins: &[Pin]) -> Result<i64, String> {
 }
 
 /// What the placement did, in the causal trail.
-fn emit_placement_events(pins: &[Pin], placed: &[Placed], unplaced: &[usize]) {
+fn emit_placement_events(pins: &[Pin], placed: &[matching::Placed], unplaced: &[usize]) {
     use vyges_events::{Event, Severity};
 
     for &i in unplaced {
