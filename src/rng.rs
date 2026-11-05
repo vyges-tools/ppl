@@ -88,8 +88,7 @@ impl Mt19937 {
             return min;
         }
         let range = (max - min) as u64;
-        // Integer division, deliberately: the remainder is the tail that gets rejected below.
-        let bucket = (Self::BRANGE as u64) / (range + 1);
+        let bucket = bucket_size(range);
         loop {
             let result = self.next_u32() as u64 / bucket;
             if result <= range {
@@ -121,6 +120,22 @@ impl Mt19937 {
             v.swap(i, j);
         }
     }
+}
+
+/// The width of one bucket of [`Mt19937::uniform_int`] over `[0, range]`.
+///
+/// Rule (boost `generate_uniform_int`, engine span equal to the unsigned maximum): the span
+/// `2^32 - 1` divided by `range + 1`, **plus one when the remainder is `range`** — that is, when
+/// `range + 1` divides `2^32` (a power of two), so the buckets tile all `2^32` outputs exactly and
+/// nothing is rejected. Integer division alone leaves those buckets one short, which shifts the
+/// value of a fraction of draws and rejects ones boost keeps.
+pub(crate) fn bucket_size(range: u64) -> u64 {
+    let brange = Mt19937::BRANGE as u64;
+    let mut bucket = brange / (range + 1);
+    if brange % (range + 1) == range {
+        bucket += 1;
+    }
+    bucket
 }
 
 #[cfg(test)]
@@ -159,6 +174,19 @@ mod tests {
         let mut g = Mt19937::new(42);
         let got: Vec<i64> = (0..8).map(|_| g.uniform_int(3, 1_000_000)).collect();
         assert_eq!(got, vec![374627, 796725, 950931, 183479, 732161, 779869, 598796, 596987]);
+    }
+
+    #[test]
+    fn a_power_of_two_range_widens_its_bucket_by_one() {
+        // Rule (boost generate_uniform_int): when range + 1 divides 2^32 the bucket is
+        // (2^32 - 1) / (range + 1) + 1, not the bare quotient. Boost draw 17332 of
+        // uniform_int(0, 1023) from seed 42 is 723 (raw 3036675749); the bare quotient gives 724.
+        assert_eq!(bucket_size(1023), 4_194_304);
+        assert_eq!(bucket_size(1), 2_147_483_648);
+        assert_eq!(bucket_size(999), 4_294_967);
+        let mut g = Mt19937::new(42);
+        let got: Vec<i64> = (0..28342).map(|_| g.uniform_int(0, 1023)).collect();
+        assert_eq!((got[17332], got[28194], got[28341]), (723, 997, 834));
     }
 
     #[test]
