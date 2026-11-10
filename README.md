@@ -1,5 +1,7 @@
 # vyges-ppl
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 IO pin placement over an OpenDB database.
 
 A block's pins sit on its die boundary, and where they sit decides how much wire the rest of the
