@@ -51,6 +51,11 @@ jobs:
       # No --locked: Cargo.lock is gitignored here (as in opendb), and the [patch] resolves the
       # opendb crates to the freshly-checked-out siblings — let Cargo resolve.
       - name: Build
-        run: cargo build --release --verbose
+        run: cargo build --release --features mimalloc --verbose
       - name: Test
+        # Tests only: LTO and codegen units cannot change a result (language rule), so a test
+        # binary built without them tests the same code; release builds keep [profile.release].
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: cargo test --release --verbose

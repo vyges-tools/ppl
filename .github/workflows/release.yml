@@ -129,7 +129,7 @@ jobs:
         # parsers.
         run: |
           [ "${{ runner.os }}" = "macOS" ] && export PATH="$(brew --prefix bison)/bin:$PATH"
-          cargo build --release --bin vyges-ppl
+          cargo build --release --features mimalloc --bin vyges-ppl
 
       # Runner and glibc floor, one policy for every release: vyges-tools/actions.
       - name: glibc ceiling
