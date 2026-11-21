@@ -491,6 +491,15 @@ pub fn run_hungarian_matching(db: &mut Db, minimize_displacement: bool, log: &mu
     let b = grid.boundary;
     let die = (b.x0, b.y0, b.x1, b.y1);
     let net = init_netlist(db, die, &grid.slots, per_section, minimize_displacement);
+    // `reportMinDistances` after `initNetlistAndCore` (#12094): the run prints the default line
+    // (or the per-layer distances) itself now, so `global_placement -place_ios` prints it too.
+    for line in crate::session::min_distance_lines(db, &args.hor, &args.ver, &args.params) {
+        match line {
+            crate::session::MinDistanceLine::Report(s) => log.report(s),
+            crate::session::MinDistanceLine::Warn(id, s) => log.warn("PPL", id, s),
+            crate::session::MinDistanceLine::Info(id, s) => log.info("PPL", id, s),
+        }
+    }
     let (top_slots, top_pins) = read_top_layer(db, die, &net.pins);
     for (id, text) in crate::report::config(&config(db, &grid.slots, &top_slots, &net, Some(per_section), minimize_displacement)) {
         log.info("PPL", id, text);

@@ -133,6 +133,8 @@ pub fn define_slots(
         let edge = if seg.is_vertical_pin() { Edge::Bottom } else { Edge::Left };
 
         for tracks in layers {
+            // Each layer its own min distance (`getMinDistance(layer)`, #12094).
+            let params = &params.for_layer(&tracks.layer);
             let candidates = layer_slots(tracks, edge, bounds, params, dbu_per_micron);
             if candidates.is_empty() {
                 continue;

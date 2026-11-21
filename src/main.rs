@@ -61,6 +61,7 @@ impl RunLog {
     }
 }
 
+use vyges_ppl::session::MinDistanceLine;
 use vyges_ppl::{annealing, matching, Boundary, Edge, Group, Params, Pin, Slot, SLOTS_PER_SECTION};
 
 // ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
@@ -179,7 +180,7 @@ const DESCRIBE: &str = r#"{
       "Slots are generated on the DIE boundary from each layer's routing track patterns, minus corner avoidance, minus half the pin width at each end, minus the requested minimum distance.",
       "PARTIAL: slot availability accounts for excluded regions and for fixed ports' metal, but NOT yet for macros or routing obstructions. Where a macro abuts the boundary, availability remains optimistic.",
       "The default corner avoidance is resolved once from a layer's FIRST track pattern and reused for the rest, which is the reference's behavior and is observable on layers carrying mixed-pitch patterns. Reproduced deliberately.",
-      "`-min_distance_in_tracks` with a distance of 0 is a division by zero in the reference; here it keeps every candidate. A deliberate divergence, on an input that has no defined meaning.",
+      "`-min_distance_in_tracks` with a distance of 0 is refused (PPL-0124) as the reference refuses it; a stored in-tracks distance of 0 is a division by zero in the reference, and here it keeps every candidate. A deliberate divergence, on an input that has no defined meaning.",
       "Written against the reference ppl sources at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated."
   ],
   "invocation": {
@@ -187,6 +188,7 @@ const DESCRIBE: &str = r#"{
     "optional": [
       { "arg": "min_distance", "flag": "--min-distance" },
       { "arg": "min_distance_in_tracks", "flag": "--min-distance-in-tracks" },
+      { "arg": "layer_min_distance", "flag": "--layer-min-distance" },
       { "arg": "corner_avoidance", "flag": "--corner-avoidance" },
       { "arg": "hor_length", "flag": "--hor-length" },
       { "arg": "ver_length", "flag": "--ver-length" },
@@ -209,6 +211,7 @@ const DESCRIBE: &str = r#"{
       "ver_layers": { "type": "string", "description": "comma-separated layers for the bottom/top edges" },
       "min_distance": { "type": "number", "description": "minimum pin spacing in microns (omitted: candidates every 2 tracks)" },
       "min_distance_in_tracks": { "type": "boolean", "description": "read min_distance as a count of candidate slots instead" },
+      "layer_min_distance": { "type": "string", "description": "per-layer minimum pin spacing, 'layer distance ...' pairs in the unit min_distance_in_tracks selects; other layers use min_distance" },
       "corner_avoidance": { "type": "number", "description": "clearance from each corner in microns (omitted: 2 tracks, capped at 1um)" },
       "hor_length": { "type": "number", "description": "depth of pins on the left/right edges, in microns" },
       "ver_length": { "type": "number", "description": "depth of pins on the bottom/top edges, in microns" },
@@ -327,8 +330,9 @@ fn run_layers(opts: &Opts, db: &Db) -> (Vec<String>, Vec<String>) {
 /// one, and a minimum distance left at 0 takes the stored distance AND its in-tracks flag; a
 /// value the run gave stands. (The layers fall back likewise, each direction on its own.)
 ///
-/// ⏭ Pending upstream #12094 (per-layer IO pin minimum distance, ppl and gpl) would change what
-/// the stored minimum distance is; if it lands, this function and its test are the repin edit.
+/// The per-layer list (#12094, in the f11b4276 pin) falls back as a WHOLE: a run that gave any
+/// per-layer distance replaces the stored list for that run, and `-min_distance` alone leaves it
+/// in place (`if (parms_->getLayerMinDistances().empty())`).
 fn apply_settings(mut given: Params, stored: &Params) -> Params {
     if given.corner_avoidance < 0 {
         given.corner_avoidance = stored.corner_avoidance;
@@ -336,6 +340,9 @@ fn apply_settings(mut given: Params, stored: &Params) -> Params {
     if given.min_distance == 0 {
         given.min_distance = stored.min_distance;
         given.min_distance_in_tracks = stored.min_distance_in_tracks;
+    }
+    if given.layer_min_distance.is_empty() {
+        given.layer_min_distance = stored.layer_min_distance.clone();
     }
     given
 }
@@ -356,18 +363,33 @@ fn prepare(opts: &Opts) -> Result<Prepared, String> {
     if ver.is_empty() {
         return Err("[ERROR PPL-0018] -ver_layers or set_place_config -io_pin_ver_layers is required.".into());
     }
+    // `place_pins`' Tcl (#12094): the in-tracks flag needs a distance or a per-layer list
+    // (PPL-0037); each distance is checked by `parse_min_distance` (tracks, or microns to DBU);
+    // the per-layer list by `parse_layer_min_distance`, its layers in routing-level order as
+    // `Parameters` keeps them (a std::map by level).
+    if opts.in_tracks && opts.get("min-distance").is_none() && opts.get("layer-min-distance").is_none() {
+        return Err("[ERROR PPL-0037] -min_distance_in_tracks requires -min_distance or -layer_min_distance.".into());
+    }
+    let min_distance = match opts.get("min-distance") {
+        None => 0,
+        Some(v) => vyges_ppl::session::parse_min_distance("-min_distance", v, opts.in_tracks, dbu)?,
+    };
+    let mut layer_min_distance: Vec<(i32, String, i32, bool)> = match opts.get("layer-min-distance") {
+        None => Vec::new(),
+        Some(v) => vyges_ppl::session::parse_layer_min_distance("-layer_min_distance", v, opts.in_tracks, dbu, |n| {
+            db.layer_get_type(n).ok().map(|_| db.layer_get_routing_level(n))
+        })?
+        .into_iter()
+        .map(|(n, d)| (db.layer_get_routing_level(&n), n, d, opts.in_tracks))
+        .collect(),
+    };
+    layer_min_distance.sort_by_key(|x| x.0);
     let given = Params {
-        // In tracks it is a raw count; otherwise a length in microns. Not converting the
-        // in-tracks form is the whole point of the flag.
-        min_distance: if opts.in_tracks {
-            opts.get("min-distance")
-                .unwrap_or("0")
-                .parse::<i32>()
-                .map_err(|_| "--min-distance in tracks wants a whole number".to_string())?
-        } else {
-            microns(opts, "min-distance", dbu, 0)?
-        },
+        // In tracks it is a raw count; otherwise a length in DBU. Not converting the in-tracks
+        // form is the whole point of the flag.
+        min_distance,
         min_distance_in_tracks: opts.in_tracks,
+        layer_min_distance: layer_min_distance.into_iter().map(|(_, n, d, t)| (n, d, t)).collect(),
         corner_avoidance: microns(opts, "corner-avoidance", dbu, -1)?,
         thickness_multiplier_h: multiplier(opts, "hor-multiplier")?,
         thickness_multiplier_v: multiplier(opts, "ver-multiplier")?,
@@ -485,9 +507,14 @@ fn place_pins(args: &[String]) -> ExitCode {
         }
     }
     log.report(format!("Found {macros} macro blocks."));
-    // Only when set_place_config stored no distance either (`get_default_min_distance` is 0).
-    if opts.get("min-distance").is_none() && vyges_ppl::session::place_config_args(&p.db).params.min_distance == 0 {
-        log.report("Using 2 tracks default min distance between IO pins.".into());
+    // `reportMinDistances` (#12094: the default line moved from the Tcl into the run, which also
+    // reports the per-layer distances), on the run's own settings after `applySettings`.
+    for line in vyges_ppl::session::min_distance_lines(&p.db, &p.hor, &p.ver, &p.params) {
+        match line {
+            MinDistanceLine::Report(s) => log.report(s),
+            MinDistanceLine::Warn(id, s) => log.warn(id, s),
+            MinDistanceLine::Info(id, s) => log.info((id, s)),
+        }
     }
     let per_section = match opts.get("slots-per-section") {
         None => SLOTS_PER_SECTION,

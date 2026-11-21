@@ -88,6 +88,43 @@ pub struct Params {
     /// `set_pin_thick_multiplier`, which widens a pin and so pushes the outermost slots inward.
     pub thickness_multiplier_h: f64,
     pub thickness_multiplier_v: f64,
+    /// `-layer_min_distance` / `set_place_config -io_pin_layer_min_distance`: per pin layer, a
+    /// minimum distance and its in-tracks flag, in routing-level order. A listed layer takes its own
+    /// value in place of `min_distance` (see [`Params::for_layer`]).
+    pub layer_min_distance: Vec<(String, i32, bool)>,
+}
+
+impl Params {
+    /// Upstream rule (`Parameters::getMinDistance(layer)`, OpenROAD #12094, in the f11b4276 pin):
+    /// a layer in the per-layer list takes its own distance AND its own in-tracks flag; any other
+    /// layer takes `-min_distance` and `-min_distance_in_tracks`. Slot generation
+    /// (`findLayerSlots`'s step) and the spacing filter (`findSlots`) both read it per layer.
+    pub fn for_layer(&self, layer: &str) -> Params {
+        let mut p = self.clone();
+        if let Some(&(_, d, t)) = self.layer_min_distance.iter().find(|(l, _, _)| l == layer) {
+            p.min_distance = d;
+            p.min_distance_in_tracks = t;
+        }
+        p
+    }
+
+    /// Upstream rule (`IOPlacer::getMinDistanceInTracks`, #12094): the tracks between neighbour
+    /// slots of a layer: the 2-track default when its distance is unset (0), the count itself in
+    /// tracks, else the distance over the layer's track pitch rounded UP, in single precision
+    /// (`std::ceil(static_cast<float>(d) / pitch)`). `tech_min_distance` is the layer's largest
+    /// track pitch along the edge (`getTechMinDistance`).
+    pub fn min_distance_in_tracks(&self, layer: &str, tech_min_distance: i32) -> i32 {
+        let p = self.for_layer(layer);
+        if p.min_distance == 0 {
+            DEFAULT_MIN_DIST
+        } else if p.min_distance_in_tracks {
+            p.min_distance
+        } else {
+            // A layer with no track pattern has no pitch; the reference never reaches here for one
+            // (no slots, PPL-0026/0027 first). One keeps the division defined.
+            (p.min_distance as f32 / tech_min_distance.max(1) as f32).ceil() as i32
+        }
+    }
 }
 
 impl Default for Params {
@@ -98,6 +135,7 @@ impl Default for Params {
             corner_avoidance: -1,
             thickness_multiplier_h: 1.0,
             thickness_multiplier_v: 1.0,
+            layer_min_distance: Vec::new(),
         }
     }
 }
@@ -351,6 +389,8 @@ pub fn define_slots(
         (Edge::Left, hor_layers),
     ] {
         for tracks in layers {
+            // Each layer its own min distance (`getMinDistance(layer)`, #12094).
+            let params = &params.for_layer(&tracks.layer);
             let candidates = layer_slots(tracks, edge, boundary, params, dbu_per_micron);
             if candidates.is_empty() {
                 continue;

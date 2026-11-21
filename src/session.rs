@@ -34,6 +34,10 @@ pub struct Prepared {
     /// four-edge case. Sections are cut per segment, so this is not optional detail — it is how a
     /// polygon's slot list is divided at all.
     pub on_segment: Option<Vec<usize>>,
+    /// The run's pin layers and settings, after `applySettings` (what `reportMinDistances` reads).
+    pub hor: Vec<String>,
+    pub ver: Vec<String>,
+    pub params: Params,
 }
 
 /// Read one layer's contribution to a slot list.
@@ -64,7 +68,18 @@ pub fn read_layer(db: &Db, layer: &str, vertical_pins: bool) -> Result<LayerTrac
 /// fixed pins' keep-outs.
 pub fn prepare_slots(db: Db, a: &SlotArgs) -> Result<Prepared, String> {
     let g = slot_grid(&db, a)?;
-    Ok(Prepared { exclusions: g.exclusions, on_segment: g.on_segment, db, boundary: g.boundary, dbu: g.dbu, slots: g.slots, trackless: g.trackless })
+    Ok(Prepared {
+        exclusions: g.exclusions,
+        on_segment: g.on_segment,
+        db,
+        boundary: g.boundary,
+        dbu: g.dbu,
+        slots: g.slots,
+        trackless: g.trackless,
+        hor: a.hor.clone(),
+        ver: a.ver.clone(),
+        params: a.params.clone(),
+    })
 }
 
 /// The slot list [`prepare_slots`] builds, without taking the database.
@@ -244,6 +259,23 @@ pub fn slot_grid(db: &Db, a: &SlotArgs) -> Result<SlotGrid, String> {
 
 
 
+/// Upstream rule (`IOPlacer::getSettings`, #12094): `values >> layer_name >> min_dist` over the
+/// stored string, so reading stops at the first pair whose distance is not an integer; a layer
+/// with routing level 0 (unknown, or not a routing layer) is dropped; the pairs land in a map by
+/// routing level, so they come back in level order and a repeated layer keeps its last value.
+pub fn layer_min_distance_pairs(text: &str, in_tracks: bool, level: impl Fn(&str) -> i32) -> Vec<(String, i32, bool)> {
+    let mut by_level = std::collections::BTreeMap::new();
+    let mut words = text.split_whitespace();
+    while let (Some(name), Some(dist)) = (words.next(), words.next()) {
+        let Ok(d) = dist.parse::<i32>() else { break };
+        let l = level(name);
+        if l != 0 {
+            by_level.insert(l, (name.to_string(), d, in_tracks));
+        }
+    }
+    by_level.into_values().collect()
+}
+
 /// `IOPlacer::getSettings` + `applySettings` for a caller that set nothing of its own (the global
 /// placer's `buildSlotGrid`): the pin layers, corner avoidance and minimum distance that
 /// `set_place_config` stored in the block's properties. Each layer list is a set of routing
@@ -267,5 +299,238 @@ pub fn place_config_args(db: &Db) -> SlotArgs {
         params.min_distance = v;
         params.min_distance_in_tracks = db.block_bool_property("place_config_io_pin_min_distance_in_tracks").ok().flatten().unwrap_or(false);
     }
+    // `getSettings` (#12094): the stored "layer distance ..." pairs, a layer the technology does
+    // not have as a routing layer dropped, keyed by routing level (a std::map, so level order and
+    // a repeated layer's last value), with their own in-tracks flag.
+    let text = db.block_string_property("place_config_io_pin_layer_min_distance").ok().flatten().unwrap_or_default();
+    let in_tracks = db.block_bool_property("place_config_io_pin_layer_min_distance_in_tracks").ok().flatten().unwrap_or(false);
+    params.layer_min_distance = layer_min_distance_pairs(&text, in_tracks, |n| {
+        if known.contains(n) { db.layer_get_routing_level(n) } else { 0 }
+    });
     SlotArgs { hor: layers("place_config_io_pin_hor_layers"), ver: layers("place_config_io_pin_ver_layers"), params, hor_length: None, ver_length: None }
+}
+
+/// One line of [`min_distance_lines`], in the logger's three kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MinDistanceLine {
+    /// An uncoded line (`logger_->report`).
+    Report(String),
+    Warn(u16, String),
+    Info(u16, String),
+}
+
+/// Upstream rule (`IOPlacer::reportMinDistances`, OpenROAD #12094, in the f11b4276 pin; called by
+/// both runs after `initNetlistAndCore`, so `place_pins` AND `global_placement -place_ios` print
+/// it): with no per-layer list, the 2-track default line when the run's min distance (after
+/// `applySettings`) is unset, and nothing otherwise; with a list, PPL-0125 for each listed layer
+/// (level order) that is not a pin layer, then PPL-0126 with every pin layer (hor and ver
+/// together, level order) and its tracks between slots. A layer's pitch is its largest track
+/// pitch along its edges (`getTechMinDistance`: the X patterns for a vertical-pin layer).
+pub fn min_distance_lines(db: &Db, hor: &[String], ver: &[String], params: &Params) -> Vec<MinDistanceLine> {
+    min_distance_lines_with(hor, ver, params, |l| db.layer_get_routing_level(l), |l, vertical| {
+        read_layer(db, l, vertical).ok().and_then(|t| t.patterns.iter().map(|p| p.step).max()).unwrap_or(0)
+    })
+}
+
+/// [`min_distance_lines`] on a routing-level map and a pitch reader (`pitch(layer, vertical)`).
+pub fn min_distance_lines_with(
+    hor: &[String],
+    ver: &[String],
+    params: &Params,
+    level: impl Fn(&str) -> i32,
+    pitch: impl Fn(&str, bool) -> i32,
+) -> Vec<MinDistanceLine> {
+    let mut out = Vec::new();
+    if params.layer_min_distance.is_empty() {
+        if params.min_distance == 0 {
+            out.push(MinDistanceLine::Report(format!("Using {} tracks default min distance between IO pins.", crate::slots::DEFAULT_MIN_DIST)));
+        }
+        return out;
+    }
+    let is_pin_layer = |l: &str| hor.iter().chain(ver).any(|x| x == l);
+    for (name, _, _) in &params.layer_min_distance {
+        if !is_pin_layer(name) {
+            out.push(MinDistanceLine::Warn(125, format!("The min distance of layer {name} is unused because it is not an IO pin layer.")));
+        }
+    }
+    let mut layers: std::collections::BTreeMap<i32, &str> = std::collections::BTreeMap::new();
+    for l in hor.iter().chain(ver) {
+        layers.entry(level(l)).or_insert(l);
+    }
+    let per_layer: Vec<String> = layers
+        .values()
+        .map(|l| {
+            let vertical = ver.iter().any(|x| x == l);
+            format!("{l} {}", params.min_distance_in_tracks(l, pitch(l, vertical)))
+        })
+        .collect();
+    out.push(MinDistanceLine::Info(126, format!("Min distance in tracks    {}", per_layer.join(", "))));
+    out
+}
+
+/// Upstream rule (`ppl::parse_min_distance`, place_pins' and set_place_config's Tcl, #12094):
+/// in tracks, a decimal whole number above zero (`^0*([1-9][0-9]*)$`, leading zeros dropped, so
+/// `010` is ten and `0x4` is refused), else PPL-0124; in microns, digits with an optional point
+/// (`^([0-9]+\.?[0-9]*|\.[0-9]+)$`) that read as non-zero, else PPL-0130, then
+/// `ord::microns_to_dbu` (rounded) and PPL-0128 when that is zero. Returns tracks or DBU.
+pub fn parse_min_distance(option: &str, dist: &str, in_tracks: bool, dbu_per_micron: i32) -> Result<i32, String> {
+    if in_tracks {
+        let digits = dist.trim_start_matches('0');
+        let ok = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        return match digits.parse::<i32>() {
+            Ok(n) if ok => Ok(n),
+            _ => Err(format!("[ERROR PPL-0124] {option}: {dist} is not a whole number of tracks greater than zero.")),
+        };
+    }
+    let (int, frac) = dist.split_once('.').unwrap_or((dist, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let shape = digits(int) && digits(frac) && !(int.is_empty() && frac.is_empty()) && !(int.is_empty() && !dist.contains('.'));
+    let microns = if shape { format!("0{dist}").parse::<f64>().unwrap_or(0.0) } else { 0.0 };
+    if !shape || microns == 0.0 {
+        return Err(format!("[ERROR PPL-0130] {option}: {dist} is not a number of microns greater than zero."));
+    }
+    let dbu = (microns * dbu_per_micron as f64).round() as i32;
+    if dbu == 0 {
+        return Err(format!("[ERROR PPL-0128] {option}: {dist} um is smaller than one database unit."));
+    }
+    Ok(dbu)
+}
+
+/// Upstream rule (`ppl::parse_layer_min_distance`, #12094): an even, non-empty list of layer and
+/// distance pairs (PPL-0123); each layer known (`parse_layer_name`, PPL-0051), a routing layer
+/// (PPL-0129) and named once (PPL-0127, by the technology's name); each distance through
+/// [`parse_min_distance`] with the option and layer in its message. Pairs in the order given.
+/// `level` is the routing level of a known layer, `None` for an unknown name.
+pub fn parse_layer_min_distance(
+    option: &str,
+    text: &str,
+    in_tracks: bool,
+    dbu_per_micron: i32,
+    level: impl Fn(&str) -> Option<i32>,
+) -> Result<Vec<(String, i32)>, String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() || !words.len().is_multiple_of(2) {
+        return Err(format!("[ERROR PPL-0123] {option} must be a list of layer and distance pairs."));
+    }
+    let mut out: Vec<(String, i32)> = Vec::new();
+    for pair in words.chunks(2) {
+        let (name, dist) = (pair[0], pair[1]);
+        match level(name) {
+            None => return Err(format!("[ERROR PPL-0051] Layer {name} not found.")),
+            Some(0) => return Err(format!("[ERROR PPL-0129] {option} layer {name} is not a routing layer.")),
+            Some(_) => {}
+        }
+        if out.iter().any(|(n, _)| n == name) {
+            return Err(format!("[ERROR PPL-0127] {option} gives layer {name} more than once."));
+        }
+        out.push((name.to_string(), parse_min_distance(&format!("{option} {name}"), dist, in_tracks, dbu_per_micron)?));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Nangate45 as upstream's place_config test reads it: DBU 2000, metal2 (vertical pins) track
+    // pitch 0.19 um = 380, metal3 (horizontal pins) 0.14 um = 280; metal4 a routing layer not used
+    // for pins; via1 a cut layer.
+    fn level(l: &str) -> i32 {
+        match l {
+            "metal2" => 2,
+            "metal3" => 3,
+            "metal4" => 4,
+            _ => 0,
+        }
+    }
+    fn pitch(l: &str, _vertical: bool) -> i32 {
+        match l {
+            "metal2" => 380,
+            "metal3" => 280,
+            _ => 0,
+        }
+    }
+    fn lines(p: &Params) -> Vec<MinDistanceLine> {
+        min_distance_lines_with(&["metal3".into()], &["metal2".into()], p, level, pitch)
+    }
+
+    /// Upstream rule (`IOPlacer::reportMinDistances` + `getMinDistanceInTracks`, OpenROAD #12094,
+    /// in the f11b4276 pin), every line its test `ppl/test/place_config.ok` prints for a run:
+    /// no list and no distance gives the default line; a list gives PPL-0126 over every pin layer
+    /// in level order (a listed layer its own value, the rest the run's distance or the 2-track
+    /// default; microns over the pitch rounded up); a listed layer that is not a pin layer warns
+    /// PPL-0125 first; a distance with no list prints nothing.
+    #[test]
+    fn the_run_reports_each_pin_layers_min_distance_in_tracks() {
+        let info = |s: &str| MinDistanceLine::Info(126, format!("Min distance in tracks    {s}"));
+        assert_eq!(lines(&Params::default()), vec![MinDistanceLine::Report("Using 2 tracks default min distance between IO pins.".into())]);
+        assert!(lines(&Params { min_distance: 2000, ..Params::default() }).is_empty());
+        let stored = vec![("metal2".to_string(), 3, true), ("metal3".to_string(), 4, true)];
+        assert_eq!(lines(&Params { layer_min_distance: stored, ..Params::default() }), vec![info("metal2 3, metal3 4")]);
+        let one = vec![("metal3".to_string(), 1, true)];
+        assert_eq!(lines(&Params { layer_min_distance: one, ..Params::default() }), vec![info("metal2 2, metal3 1")]);
+        // set_place_config -io_pin_min_distance 0.38 -io_pin_layer_min_distance {metal3 0.28}
+        let um = vec![("metal3".to_string(), 560, false)];
+        assert_eq!(lines(&Params { min_distance: 760, layer_min_distance: um, ..Params::default() }), vec![info("metal2 2, metal3 2")]);
+        // ... -io_pin_layer_min_distance {metal4 1} -io_pin_min_distance_in_tracks: 0.38 um is
+        // 2 metal2 tracks and ceil(760 / 280) = 3 metal3 tracks.
+        let off = vec![("metal4".to_string(), 1, true)];
+        assert_eq!(
+            lines(&Params { min_distance: 760, layer_min_distance: off, ..Params::default() }),
+            vec![
+                MinDistanceLine::Warn(125, "The min distance of layer metal4 is unused because it is not an IO pin layer.".into()),
+                info("metal2 2, metal3 3"),
+            ]
+        );
+    }
+
+    /// Upstream rule (`Parameters::getMinDistance(layer)`, #12094): a listed layer takes its own
+    /// distance and in-tracks flag, every other layer the run's; the slot step and the spacing
+    /// filter read it per layer.
+    #[test]
+    fn a_listed_layer_takes_its_own_min_distance_and_unit() {
+        let p = Params { min_distance: 760, layer_min_distance: vec![("metal3".into(), 4, true)], ..Params::default() };
+        let m3 = p.for_layer("metal3");
+        assert_eq!((m3.min_distance, m3.min_distance_in_tracks), (4, true));
+        let m2 = p.for_layer("metal2");
+        assert_eq!((m2.min_distance, m2.min_distance_in_tracks), (760, false));
+        // An explicit per-layer distance puts candidates on every track of that layer only.
+        assert_eq!(crate::slot_step(&m3, 280), 280);
+        assert_eq!(crate::slot_step(&Params::default().for_layer("metal2"), 380), 760);
+    }
+
+    /// Upstream rule (`getSettings`, #12094): the stored pairs by routing level, a non-routing or
+    /// unknown layer dropped, the in-tracks flag their own.
+    #[test]
+    fn the_stored_list_is_read_by_routing_level() {
+        assert_eq!(
+            layer_min_distance_pairs("metal3 4 metal2 3 via1 2", true, level),
+            vec![("metal2".to_string(), 3, true), ("metal3".to_string(), 4, true)]
+        );
+        assert!(layer_min_distance_pairs("", false, level).is_empty());
+    }
+
+    /// Upstream rule (`ppl::parse_min_distance` / `parse_layer_min_distance`, #12094), each error
+    /// `place_config.ok` prints, and the values it accepts (DBU 2000).
+    #[test]
+    fn min_distances_are_checked_as_the_reference_checks_them() {
+        let lv = |l: &str| if l == "nope" { None } else { Some(level(l)) };
+        let o = "-io_pin_layer_min_distance";
+        let err = |t: &str, tr: bool| parse_layer_min_distance(o, t, tr, 2000, lv).unwrap_err();
+        assert_eq!(err("metal3", false), "[ERROR PPL-0123] -io_pin_layer_min_distance must be a list of layer and distance pairs.");
+        assert_eq!(err("metal3 0", false), "[ERROR PPL-0130] -io_pin_layer_min_distance metal3: 0 is not a number of microns greater than zero.");
+        assert_eq!(err("metal3 1 metal3 2", false), "[ERROR PPL-0127] -io_pin_layer_min_distance gives layer metal3 more than once.");
+        assert_eq!(err("metal3 0.0001", false), "[ERROR PPL-0128] -io_pin_layer_min_distance metal3: 0.0001 um is smaller than one database unit.");
+        assert_eq!(err("metal3 0x4", true), "[ERROR PPL-0124] -io_pin_layer_min_distance metal3: 0x4 is not a whole number of tracks greater than zero.");
+        assert_eq!(err("via1 2", false), "[ERROR PPL-0129] -io_pin_layer_min_distance layer via1 is not a routing layer.");
+        assert_eq!(err("nope 2", false), "[ERROR PPL-0051] Layer nope not found.");
+        let one = |d: &str, tr: bool| parse_min_distance("-min_distance", d, tr, 2000);
+        assert_eq!(one("-1", false).unwrap_err(), "[ERROR PPL-0130] -min_distance: -1 is not a number of microns greater than zero.");
+        assert_eq!(one("0x4", false).unwrap_err(), "[ERROR PPL-0130] -min_distance: 0x4 is not a number of microns greater than zero.");
+        assert_eq!(one("2.5", true).unwrap_err(), "[ERROR PPL-0124] -min_distance: 2.5 is not a whole number of tracks greater than zero.");
+        assert_eq!(one("0", true).unwrap_err(), "[ERROR PPL-0124] -min_distance: 0 is not a whole number of tracks greater than zero.");
+        assert!(one(".", false).is_err() && one("", false).is_err() && one("1.2.3", false).is_err());
+        assert_eq!((one("010", true), one("0.38", false), one("1.", false), one(".5", false)), (Ok(10), Ok(760), Ok(2000), Ok(1000)));
+        assert_eq!(parse_layer_min_distance(o, "metal3 4 metal2 3", true, 2000, lv), Ok(vec![("metal3".into(), 4), ("metal2".into(), 3)]));
+    }
 }

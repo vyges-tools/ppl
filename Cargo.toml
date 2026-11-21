@@ -21,11 +21,11 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # The database is the substrate and the output: ppl reads the tracks and terminals and
 # writes the placed pins.
 # gen-write: the generated SETTERS (placement status, source type) are behind that feature.
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", features = ["gen-write"] }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "repin-f11b4276", features = ["gen-write"] }
 vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false }
 # Rectilinear polygon sets (loom::poly90) — the row region's boundary is a union of row
 # rectangles clipped to the core, and its holes are the macros carved out of it.
-vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
+vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "repin-f11b4276" }
 serde_json = "1"
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
